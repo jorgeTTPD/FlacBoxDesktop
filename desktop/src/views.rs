@@ -4,8 +4,10 @@ use gpui::prelude::*;
 use gpui::*;
 
 use flacplayer::engine::Cmd;
+use flacplayer::lyrics::LyricSource;
 use flacplayer::shared::{STATUS_ENDED, STATUS_PAUSED, STATUS_PLAYING};
 
+use crate::lyrics::LyricsStatus;
 use crate::theme::*;
 use crate::{Drill, FlacBox, Tab};
 
@@ -286,7 +288,12 @@ pub fn main_area(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElem
                 cx.notify();
             }))
             .child(icon("‹", 14., MUTED))
-            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("Atrás"))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .child("Atrás"),
+            )
             .into_any_element()
     } else {
         div().into_any_element()
@@ -1150,6 +1157,107 @@ pub fn now_playing(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoEl
                             .children(queue_rows),
                     ),
             )
+        })
+        .child(lyrics_panel(this))
+}
+
+// ------------------------------------------------------------- letra
+
+/// Recuadro de letra sincronizada, a la derecha de la vista "Ahora suena".
+pub fn lyrics_panel(this: &FlacBox) -> impl IntoElement {
+    let badge = match this.lyrics.as_ref().map(|l| l.source) {
+        Some(LyricSource::Embedded) => "embebida",
+        Some(LyricSource::Sidecar) => "archivo .lrc",
+        Some(LyricSource::Lrclib) => "lrclib.net",
+        Some(LyricSource::Plain) => "sin sincronizar",
+        Some(LyricSource::Unknown) | None => "",
+    };
+
+    let lines: Vec<AnyElement> = match this.lyrics.as_ref() {
+        Some(lyrics) if !lyrics.is_empty() => lyrics
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let is_active = lyrics.synced && this.lyrics_active == Some(i);
+                div()
+                    .id(("lyric", i))
+                    .w_full()
+                    .px_2()
+                    .py_2()
+                    .rounded(px(6.))
+                    .when(is_active, |el| el.bg(rgb(SURFACE_HI)))
+                    .text_size(px(if is_active { 15. } else { 13.5 }))
+                    .text_color(rgb(if is_active { ACCENT } else { MUTED }))
+                    .when(is_active, |el| el.font_weight(FontWeight::SEMIBOLD))
+                    .child(if line.text.trim().is_empty() {
+                        "·".to_string()
+                    } else {
+                        line.text.clone()
+                    })
+                    .into_any_element()
+            })
+            .collect(),
+        _ => {
+            let message = match this.lyrics_status {
+                LyricsStatus::Loading => "Buscando letra…".to_string(),
+                LyricsStatus::Empty => "Sin letra disponible".to_string(),
+                _ => "Nada sonando".to_string(),
+            };
+            vec![div()
+                .text_size(px(12.))
+                .text_color(rgb(MUTED))
+                .child(message)
+                .into_any_element()]
+        }
+    };
+
+    div()
+        .w(px(380.))
+        .flex_shrink_0()
+        .h_full()
+        .flex()
+        .flex_col()
+        .bg(rgb(SURFACE))
+        .border_l_1()
+        .border_color(rgb(BORDER))
+        .child(
+            div()
+                .h(px(44.))
+                .flex_shrink_0()
+                .px_4()
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT))
+                        .child("Letra"),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(ACCENT_DIM))
+                        .child(badge),
+                ),
+        )
+        .child(
+            div()
+                .id("lyrics-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(&this.lyrics_scroll)
+                .px_4()
+                .py_4()
+                .children(lines),
+        )
+        .when(this.lyrics_status == LyricsStatus::Loading, |el| {
+            el.opacity(0.6)
         })
 }
 

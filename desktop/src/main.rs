@@ -1,4 +1,5 @@
 mod library;
+mod lyrics;
 mod theme;
 mod views;
 
@@ -7,15 +8,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use gpui::prelude::*;
 use gpui::*;
 
 use flacplayer::engine::Cmd;
+use flacplayer::lyrics::Lyrics;
 use flacplayer::player::{Player, Snapshot};
 use flacplayer::shared::{STATUS_ENDED, STATUS_ERROR, STATUS_PAUSED, STATUS_PLAYING};
 
 use library::{Library, ScanMsg, Track};
+use lyrics::{LyricsRequest, LyricsResult, LyricsStatus};
 use theme::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,6 +54,14 @@ pub struct FlacBox {
     pub folder_focus: FocusHandle,
     pub art_cache: HashMap<PathBuf, Option<Arc<Image>>>,
     pub status_line: Option<String>,
+    pub lyrics: Option<Lyrics>,
+    pub lyrics_status: LyricsStatus,
+    pub lyrics_scroll: ScrollHandle,
+    lyrics_tx: Sender<LyricsResult>,
+    lyrics_rx: Receiver<LyricsResult>,
+    lyrics_key: Option<String>,
+    lyrics_track: Option<String>,
+    lyrics_active: Option<usize>,
     last_pos: i64,
     last_status: u8,
     last_index: i32,
@@ -61,6 +72,7 @@ impl FlacBox {
         let start = std::env::var("FLACBOX_START_VIEW").unwrap_or_default();
         let player = Arc::new(Player::spawn().expect("no se pudo arrancar el motor de audio"));
         let (tx, rx) = unbounded();
+        let (lyrics_tx, lyrics_rx) = unbounded();
 
         let mut folders = library::default_folders();
         folders.extend(read_extra_folders());
@@ -95,6 +107,14 @@ impl FlacBox {
             folder_focus: cx.focus_handle(),
             art_cache: HashMap::new(),
             status_line: None,
+            lyrics: None,
+            lyrics_status: LyricsStatus::Idle,
+            lyrics_scroll: ScrollHandle::new(),
+            lyrics_tx,
+            lyrics_rx,
+            lyrics_key: None,
+            lyrics_track: None,
+            lyrics_active: None,
             last_pos: -1,
             last_status: 255,
             last_index: -1,
@@ -150,9 +170,78 @@ impl FlacBox {
         self.last_index = snap.index;
         self.snap = snap;
 
+        self.update_lyrics(cx);
+        self.update_lyrics_position(cx);
+
         if dirty {
             cx.notify();
         }
+    }
+
+    /// Pide la letra cuando cambia la pista y recoge el resultado del hilo.
+    fn update_lyrics(&mut self, cx: &mut Context<Self>) {
+        while let Ok(result) = self.lyrics_rx.try_recv() {
+            if self.lyrics_key.as_deref() != Some(result.key.as_str()) {
+                continue;
+            }
+            self.lyrics = result.lyrics;
+            self.lyrics_status = match &self.lyrics {
+                Some(l) if !l.is_empty() => LyricsStatus::Ready,
+                _ => LyricsStatus::Empty,
+            };
+            self.lyrics_active = None;
+            cx.notify();
+        }
+
+        let track = self.current_track().cloned();
+        let identity = track.as_ref().map(|t| t.path.to_string_lossy().to_string());
+        if identity == self.lyrics_track {
+            return;
+        }
+        self.lyrics_track = identity;
+        self.lyrics = None;
+        self.lyrics_active = None;
+        self.lyrics_key = None;
+        self.lyrics_scroll.set_offset(point(px(0.), px(0.)));
+
+        let Some(track) = track else {
+            self.lyrics_status = LyricsStatus::Idle;
+            cx.notify();
+            return;
+        };
+
+        self.lyrics_status = LyricsStatus::Loading;
+        let key = flacplayer::lyrics::cache_key(&track.title, &track.artist, &track.album);
+        self.lyrics_key = Some(key.clone());
+        lyrics::spawn_resolve(
+            LyricsRequest {
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                album: track.album.clone(),
+                duration_ms: track.duration_ms as i64,
+                audio_path: Some(track.path.clone()),
+            },
+            key,
+            self.lyrics_tx.clone(),
+        );
+        cx.notify();
+    }
+
+    /// Línea de letra activa y auto-scroll del panel para mantenerla visible.
+    fn update_lyrics_position(&mut self, cx: &mut Context<Self>) {
+        let Some(lyrics) = &self.lyrics else { return };
+        if !lyrics.synced {
+            return;
+        }
+        let active = lyrics.active_index(self.snap.position_ms);
+        if active == self.lyrics_active {
+            return;
+        }
+        self.lyrics_active = active;
+        if let Some(index) = active {
+            self.lyrics_scroll.scroll_to_item(index);
+        }
+        cx.notify();
     }
 
     pub fn is_playing(&self) -> bool {

@@ -2,6 +2,7 @@ pub mod decoder;
 pub mod engine;
 #[cfg(target_os = "android")]
 mod jni_api;
+pub mod lyrics;
 pub mod metadata;
 pub mod player;
 pub mod shared;
