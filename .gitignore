@@ -1,0 +1,7 @@
+# Rust
+target/
+**/target/
+
+# Logs / temporales
+*.log
+.DS_Store

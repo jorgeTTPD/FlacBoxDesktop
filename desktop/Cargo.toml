@@ -1,0 +1,16 @@
+[package]
+name = "flacbox-desktop"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+gpui = { version = "0.2", features = ["x11"] }
+flacbox-core = { path = "../rust" }
+crossbeam-channel = "0.5"
+walkdir = "2"
+libc = "=0.2.189"
+
+[profile.dev]
+debug = 0
+incremental = false
