@@ -33,21 +33,16 @@ cargo build --release
 
 El perfil de desarrollo usa `debug = 0` e `incremental = false` porque compilar GPUI con debuginfo consume varios GB de RAM.
 
-## Atajos
+## Pruebas
 
-| Tecla | Acción |
-| --- | --- |
-| `1` / `2` / `3` | Canciones / Álbumes / Artistas |
-| `Espacio` | Reproducir / pausar |
-| `←` / `→` | Retroceder / avanzar 5 s |
-| `n` / `p` | Siguiente / anterior |
-| `f` | Vista "Ahora suena" |
-| `Esc` | Cerrar modal, cola o vista, o volver atrás |
+```bash
+cd core && cargo test
+```
 
 ## Estructura
 
 - `desktop/` — app GPUI (interfaz, biblioteca, vistas).
-- `rust/` — motor de audio: decodificador, mezcla, backend de salida (`oboe` en Android, `cpal` en escritorio) y API `Player` sin JNI.
+- `core/` — motor de audio: decodificador, mezcla, backend de salida (`oboe` en Android, `cpal` en escritorio) y API `Player` sin JNI.
 
 ## Estado
 

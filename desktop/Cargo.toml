@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 gpui = { version = "0.2", features = ["x11"] }
-flacbox-core = { path = "../rust" }
+flacplayer = { path = "../core" }
 crossbeam-channel = "0.5"
 walkdir = "2"
 libc = "=0.2.189"
