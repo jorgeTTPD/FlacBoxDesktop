@@ -1,40 +1,138 @@
 # FlacBox Desktop
 
-Reproductor de música de escritorio (Linux) hecho con [GPUI](https://crates.io/crates/gpui) (la librería de UI de Zed) sobre un motor de audio propio en Rust.
+Reproductor de música para escritorio Linux hecho con GPUI (la librería de UI de Zed)
+sobre un motor de audio propio en Rust.
 
-Comparte el mismo motor que la versión Android: decodificación con Symphonia (FLAC, MP3, AAC/M4A, OGG, Opus, WAV), cola, shuffle/repeat, seek y carátulas embebidas leídas con Lofty.
+Un FlacBox real en tu máquina: tu biblioteca local FLAC/MP3/AAC/OGG/Opus/WAV con letras
+sincronizadas, YouTube integrado (búsqueda, caché y reproducción como archivo local, audio y
+vídeo), búsqueda en vivo, colas y carátulas. Sin cuenta, sin publicidad, sin nube.
+Tu música, tu portátil.
 
-## Funcionalidad
 
-- Biblioteca local: canciones, álbumes y artistas, con búsqueda en vivo.
+## Características
+
+- Biblioteca local completa: canciones, álbumes y artistas, búsqueda en vivo (Esc limpia),
+  escaneo incremental con barra de estado.
 - Cola de reproducción, aleatorio y repetición (off / todo / una).
-- Barra inferior con carátula, título, artista, tiempo y seek.
-- Vista "Ahora suena" a pantalla completa: portada (estilo Spotify) con letras sincronizadas al lado en ventanas anchas, y reflow a formato vertical al estrechar la ventana (mosaico bspwm/sway). `l` alterna el modo letras a pantalla completa (estilo Pixel Player) con fondo derivado del color dominante de la carátula.
-- Carpetas de música: por defecto `~/Música` y `~/Music`; puedes añadir más y quedan guardadas en `~/.config/flacbox/folders`.
-- **Internet** (pestaña, tecla `4`): búsqueda en YouTube vía `yt-dlp`, resultados con miniatura/duración/vistas. Botón ▷ → descarga `bestaudio` al cache (`~/.cache/flacbox/streams`) y suena como archivo local (seek, duración, shuffle, cola, portada de la miniatura y letras LRCLIB). Botón ▣ → descarga el video (`bestvideo+bestaudio` 480p, merge mkv/mp4) y **lo reproduce dentro de «Ahora suena»** (vídeo integrado en la app, audio vía GStreamer). Requiere `yt-dlp` (`pacman -S yt-dlp`); **el video integrado además requiere GStreamer 1.14+** con plugins base/good(+bad/libav para H.264/AV1) (`pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav`).
-- Nota legal: YouTube no licencia oficialmente el streaming por su API para clientes no oficiales; esto es para uso personal.
-- Salida de audio por ALSA/PipeWire vía `cpal`.
-- Letra sincronizada en la vista "Ahora suena", con auto-scroll a la línea activa.
+- Vista «Ahora suena» a pantalla completa: portada grande con estética dark tipo Spotify,
+  letras sincronizadas al lado en ventanas anchas, y reflow a formato vertical en ventanas
+  estrechas. Tecla `l` alterna un modo letras a pantalla completa estilo Pixel Player
+  (fondo derivado del color dominante de la carátula, línea activa centrada y resaltada).
+- Letras con orden de resolución razonable: embebida (USLT), luego .lrc junto a la pista,
+  luego caché en disco, luego LRCLIB (exacta y aproximada), luego texto plano embebido.
+- Internet (tecla `4`): búsqueda en YouTube mediante yt-dlp, con miniatura, título, canal,
+  duración y vistas. Dos botones por resultado:
 
-## Letra sincronizada
+  - ▷  bestaudio: descarga a la caché en ~/.cache/flacbox/streams y suena como archivo
+     local (seek, duración, shuffle, cola, portada de la miniatura y letras LRCLIB).
+  - ▣  video 480p fusionado: lo reproduce dentro de la app mediante gpui-video-player con
+     GStreamer. La letra queda al lado del vídeo y el selector AUDIO / VIDEO permite
+     cambiar de un click entre el audio y el vídeo del mismo resultado.
 
-La vista "Ahora suena" (`f`) muestra un recuadro de letra a la derecha, sincronizado con la posición de la pista y con auto-scroll a la línea activa. En ventanas anchas (≥1060 px) conviven portada y letra; en ventana estrecha la letra pasa al modo a pantalla completa. El modo letras a pantalla completa (botón LETRA o tecla `l`, solo con letra sincronizada disponible) ocupa toda la vista con fondo de gradiente derivado del color dominante de la carátula, la línea activa centrada y resaltada, y selector de fuente (Auto / Embebida / .LRC / Cache / Online). En este modo, `Escape` vuelve a la portada.
+- Modo vídeo completo: seek, play/pausa y tiempos con controles reales de GStreamer;
+  Esc vuelve a la portada.
+- Barra inferior siempre: carátula, título, artista, tiempo y seek interactivos.
+- Carpetas personalizadas: por defecto ~/Música y ~/Music; añade más (guardadas en
+  ~/.config/flacbox/folders).
+
+
+## Requisitos del sistema
+
+Para ejecutar (runtime):
+
+- Linux con ALSA o PipeWire (la salida de audio es vía cpal).
+- Opcional, para el modo vídeo y la búsqueda de Internet:
+  - yt-dlp (pacman -S yt-dlp, o pip install yt-dlp) — búsqueda y descarga de audio/vídeo.
+  - GStreamer 1.14+ con plugins base/good (+bad/libav para AV1 y H.264):
+    pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav
+
+Para compilar (build):
+
+- Rust estable y cargo.
+- pkgconf y los encabezados de ALSA (alsa-lib) y de GStreamer (los paquetes de arriba
+  incluyen lo necesario en Arch; en Fedora/Debian instala los dev de los mismos).
+- FFmpeg en el PATH solo si quieres el modo vídeo (yt-dlp lo emplea para fusionar
+  audio/vídeo; aquí lo tienes al instalar yt-dlp con los plugins anteriores).
+
+
+## Compilar e instalar
+
+Clona y compila en modo release:
+
+    git clone https://github.com/jorgeTTPD/FlacBoxDesktop.git
+    cd FlacBoxDesktop/desktop
+    cargo build --release
+
+El binario queda en desktop/target/release/flacbox-desktop. Cópialo donde quieras
+(por ejemplo ~/.local/bin) o crea un lanzador .desktop apuntando a él.
+
+Ejecución directa:
+
+    cargo run --release
+
+
+## Uso
+
+  Canciones / Álbumes / Artistas / Internet   pestañas principales (teclas 1 2 3 4)
+  f                                            abre/cierra «Ahora suena»
+  l                                            alterna modo letras en «Ahora suena» (si hay letra)
+  Space                                        play / pausa
+  → / ←                                        seek ±5 s
+  n / p                                        siguiente / anterior
+  Esc                                          cierra el vídeo de Internet, vuelve a la
+                                               portada, sale del modo letras o limpia la búsqueda
+  Enter (en Internet)                          lanza la búsqueda
+  Ctrl/Cmd+V                                   pega en los campos de texto
+
+
+## Rutas de datos
+
+  Carpetas extra         ~/.config/flacbox/folders
+  Caché de búsqueda YT   ~/.cache/flacbox/streams  (o FLACBOX_STREAMS_DIR)
+  Miniaturas             ~/.cache/flacbox/thumbs
+  Caché de letras        ~/.cache/flacbox/lyrics   (o FLACBOX_LYRICS_CACHE)
+  Estado / sesión        ~/.config/flacboxdesktop/state.json
+
+Variables de entorno para desarrollo o pruebas: FLACBOX_START_VIEW=albums|artists|internet
+FLACBOX_START_PLAYER=1, FLACBOX_START_MODE=lyrics, FLACBOX_START_QUERY="tu búsqueda",
+FLACBOX_VIDEO_ID=<id-del-video>.
+
 
 ## Desarrollo
 
-Variables de entorno para pruebas visuales: `FLACBOX_START_VIEW=albums|artists|internet` (pestaña inicial), `FLACBOX_START_PLAYER=1` (abre directamente "Ahora suena"), `FLACBOX_START_MODE=lyrics` (muestra el modo letras), `FLACBOX_START_QUERY="tu búsqueda"` (busca automáticamente en Internet al abrir), `FLACBOX_VIDEO_ID=<id-de-video>` (arranca con ese video de Internet en «Ahora suena», si ya está en cache). Cache de streams: `~/.cache/flacbox/streams` (o `FLACBOX_STREAMS_DIR`).
+Arquitectura en dos crates:
 
-Orden de resolución (mismo criterio que los scripts de Python de `lyrics-on-panel` y `repMusic`, portado a Rust):
+  core/      motor propio (flacplayer): decodificación Symphonia, cola, engine de audio
+             sobre cpal, letras LRC, caché de letras, tags/portadas (lofty).
+  desktop/   la aplicación GPUI: UI, vistas, Internet, vídeo integrado. Comparte el
+             motor con la versión Android.
 
-1. Letra embebida sincronizada en las etiquetas (`USLT`/`©lyr`, vía `lofty`).
-2. Archivo `.lrc` junto a la pista (`cancion.flac` → `cancion.lrc`).
-3. Cache en disco (`~/.cache/flacbox/lyrics`, o `FLACBOX_LYRICS_CACHE`).
-4. LRCLIB: coincidencia exacta con duración → búsqueda → búsqueda difusa.
-5. Letra embebida sin sincronizar, como texto plano.
+Compilar en debug:
 
-- `core/src/lyrics.rs` — parser LRC (varios timestamps por línea), línea activa, sidecar y etiquetas. Sin red.
-- `desktop/src/lyrics.rs` — fetch a LRCLIB con `ureq`, cache JSON y resolución en un hilo aparte (mismo patrón que el escaneo de biblioteca).
+    cd desktop && cargo run
 
-## Estado
+Compilar en release:
 
-Versión inicial para probar en Linux/X11. Nota: GPUI 0.2.2 sobre X11 calcula la posición del puntero dividiendo por `u16::MAX` en vez de 65536.0 (`Fp1616`) en `src/platform/linux/x11/client.rs`. El error es subpíxel en cualquier escala práctica, así que no es causa de clics mal ubicados; 0.2.2 es la última versión publicada. Si llegara a molestar, la corrección es vendorizar `gpui` localmente con `[patch.crates-io]` y cambiar el divisor.
+    cd desktop && cargo build --release
+
+
+## Aviso legal
+
+YouTube no licencia oficialmente el streaming por su API para clientes no oficiales.
+La búsqueda/descarga/caché de YouTube de esta aplicación es para uso personal y no
+afilia esta sesión a YouTube, a Google ni a Alphabet. No hay DRM de contenido premium;
+el acceso es exclusivamente a flujos públicos. Cualquier uso fuera de ese marco
+corresponde a ti.
+
+
+## Contribuciones
+
+Issues y pull requests son bienvenidos. Antes de abrir uno, deja que la biblioteca
+escanee completa, reproduce alguna pista y reproduce algún vídeo desde la pestaña
+Internet (o con FLACBOX_VIDEO_ID).
+
+
+## Licencia
+
+MIT (ver el fichero LICENSE): usa, copia, modifica, distribuye (respetando el copyright
+y la atribución). Sin garantía.
