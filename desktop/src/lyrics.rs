@@ -26,6 +26,16 @@ pub enum LyricsStatus {
     Empty,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LyricsMode {
+    #[default]
+    Auto,
+    Embedded,
+    Sidecar,
+    Cache,
+    Online,
+}
+
 /// Datos necesarios para resolver la letra de una pista.
 #[derive(Clone, Debug)]
 pub struct LyricsRequest {
@@ -45,11 +55,16 @@ pub struct LyricsResult {
 }
 
 /// Lanza la resolución en un hilo aparte (mismo patrón que el escaneo de biblioteca).
-pub fn spawn_resolve(request: LyricsRequest, key: String, tx: Sender<LyricsResult>) {
+pub fn spawn_resolve(
+    request: LyricsRequest,
+    key: String,
+    mode: LyricsMode,
+    tx: Sender<LyricsResult>,
+) {
     std::thread::Builder::new()
         .name("flacbox-lyrics".into())
         .spawn(move || {
-            let lyrics = resolve(&request);
+            let lyrics = resolve_with_mode(&request, mode);
             let _ = tx.send(LyricsResult { key, lyrics });
         })
         .ok();
@@ -59,6 +74,39 @@ pub fn spawn_resolve(request: LyricsRequest, key: String, tx: Sender<LyricsResul
 /// 1. letra embebida sincronizada · 2. `.lrc` hermano · 3. cache en disco ·
 /// 4. LRCLIB · 5. letra embebida plana como último recurso.
 pub fn resolve(request: &LyricsRequest) -> Option<Lyrics> {
+    resolve_with_mode(request, LyricsMode::Auto)
+}
+
+pub fn resolve_with_mode(request: &LyricsRequest, mode: LyricsMode) -> Option<Lyrics> {
+    if mode != LyricsMode::Auto {
+        return match mode {
+            LyricsMode::Embedded => request
+                .audio_path
+                .as_ref()
+                .and_then(|path| embedded_lyrics(path)),
+            LyricsMode::Sidecar => request
+                .audio_path
+                .as_ref()
+                .and_then(|path| read_sidecar(path)),
+            LyricsMode::Cache => {
+                cache_read(&cache_key(&request.title, &request.artist, &request.album))
+            }
+            LyricsMode::Online => fetch_lrclib(
+                &request.title,
+                &request.artist,
+                &request.album,
+                request.duration_ms,
+            )
+            .inspect(|lyrics| {
+                cache_write(
+                    &cache_key(&request.title, &request.artist, &request.album),
+                    lyrics,
+                );
+            }),
+            LyricsMode::Auto => unreachable!(),
+        };
+    }
+
     let mut plain_fallback: Option<Lyrics> = None;
 
     if let Some(path) = &request.audio_path {

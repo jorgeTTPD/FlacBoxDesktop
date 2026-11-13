@@ -3,7 +3,8 @@ mod lyrics;
 mod theme;
 mod views;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +12,7 @@ use std::time::Duration;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use gpui::prelude::*;
 use gpui::*;
+use serde::{Deserialize, Serialize};
 
 use flacplayer::engine::Cmd;
 use flacplayer::lyrics::Lyrics;
@@ -18,8 +20,50 @@ use flacplayer::player::{Player, Snapshot};
 use flacplayer::shared::{STATUS_ENDED, STATUS_ERROR, STATUS_PAUSED, STATUS_PLAYING};
 
 use library::{Library, ScanMsg, Track};
-use lyrics::{LyricsRequest, LyricsResult, LyricsStatus};
+use lyrics::{LyricsMode, LyricsRequest, LyricsResult, LyricsStatus};
 use theme::*;
+
+const ART_CACHE_LIMIT: usize = 24;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct AppState {
+    last_track: Option<String>,
+    last_position_ms: u64,
+    playlists: Vec<PlaylistState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlaylistState {
+    pub name: String,
+    pub tracks: Vec<PathBuf>,
+}
+
+fn app_state_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("flacboxdesktop")
+        .join("state.json")
+}
+
+fn load_app_state() -> AppState {
+    fs::read_to_string(app_state_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_app_state(state: &AppState) {
+    let path = app_state_path();
+    let Some(parent) = path.parent() else { return };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    if let Ok(raw) = serde_json::to_string_pretty(state) {
+        let _ = fs::write(path, raw);
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -47,16 +91,28 @@ pub struct FlacBox {
     pub queue: Vec<PathBuf>,
     pub shuffle: bool,
     pub repeat: u8,
+    pub volume: f32,
+    pub muted: bool,
+    volume_before_mute: f32,
     pub show_queue: bool,
     pub show_player: bool,
+    pub show_lyrics: bool,
+    pub playlists: Vec<PlaylistState>,
+    pub playlist_menu: Option<PathBuf>,
+    pub playlist_modal_open: bool,
+    pub playlist_input: String,
+    pub playlist_focus: FocusHandle,
     pub add_folder_open: bool,
     pub folder_input: String,
     pub folder_focus: FocusHandle,
     pub art_cache: HashMap<PathBuf, Option<Arc<Image>>>,
+    art_loading: HashSet<PathBuf>,
+    art_tx: Sender<ArtResult>,
+    art_rx: Receiver<ArtResult>,
     pub status_line: Option<String>,
     pub lyrics: Option<Lyrics>,
     pub lyrics_status: LyricsStatus,
-    pub lyrics_scroll: ScrollHandle,
+    pub lyrics_mode: LyricsMode,
     lyrics_tx: Sender<LyricsResult>,
     lyrics_rx: Receiver<LyricsResult>,
     lyrics_key: Option<String>,
@@ -65,14 +121,26 @@ pub struct FlacBox {
     last_pos: i64,
     last_status: u8,
     last_index: i32,
+    visible_cache: Option<Arc<Vec<usize>>>,
+    visible_cache_revision: u64,
+    navigation_revision: u64,
+    restored_session: bool,
+    last_saved_track: Option<PathBuf>,
+}
+
+struct ArtResult {
+    path: PathBuf,
+    bytes: Option<Vec<u8>>,
 }
 
 impl FlacBox {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let start = std::env::var("FLACBOX_START_VIEW").unwrap_or_default();
+        let saved = load_app_state();
         let player = Arc::new(Player::spawn().expect("no se pudo arrancar el motor de audio"));
         let (tx, rx) = unbounded();
         let (lyrics_tx, lyrics_rx) = unbounded();
+        let (art_tx, art_rx) = unbounded();
 
         let mut folders = library::default_folders();
         folders.extend(read_extra_folders());
@@ -100,16 +168,28 @@ impl FlacBox {
             queue: Vec::new(),
             shuffle: false,
             repeat: 0,
+            volume: 1.0,
+            muted: false,
+            volume_before_mute: 1.0,
             show_queue: start == "queue",
-            show_player: start == "player",
+            show_player: false,
+            show_lyrics: true,
+            playlists: saved.playlists,
+            playlist_menu: None,
+            playlist_modal_open: false,
+            playlist_input: String::new(),
+            playlist_focus: cx.focus_handle(),
             add_folder_open: false,
             folder_input: String::new(),
             folder_focus: cx.focus_handle(),
             art_cache: HashMap::new(),
+            art_loading: HashSet::new(),
+            art_tx,
+            art_rx,
             status_line: None,
             lyrics: None,
             lyrics_status: LyricsStatus::Idle,
-            lyrics_scroll: ScrollHandle::new(),
+            lyrics_mode: LyricsMode::Auto,
             lyrics_tx,
             lyrics_rx,
             lyrics_key: None,
@@ -118,16 +198,19 @@ impl FlacBox {
             last_pos: -1,
             last_status: 255,
             last_index: -1,
+            visible_cache: None,
+            visible_cache_revision: 0,
+            navigation_revision: 1,
+            restored_session: false,
+            last_saved_track: None,
         };
 
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(200))
-                    .await;
-                if this.update(cx, |this, cx| this.tick(cx)).is_err() {
-                    break;
-                }
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            if this.update(cx, |this, cx| this.tick(cx)).is_err() {
+                break;
             }
         })
         .detach();
@@ -143,9 +226,33 @@ impl FlacBox {
                 ScanMsg::Done(tracks) => {
                     self.lib.rebuild(tracks);
                     self.lib.scanning = false;
+                    self.restore_session();
+                    self.invalidate_navigation();
                     dirty = true;
                 }
             }
+        }
+
+        while let Ok(result) = self.art_rx.try_recv() {
+            self.art_loading.remove(&result.path);
+            let image = result.bytes.and_then(|bytes| {
+                let format = if bytes.starts_with(&[0xFF, 0xD8]) {
+                    ImageFormat::Jpeg
+                } else if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+                    ImageFormat::Png
+                } else {
+                    return None;
+                };
+                Some(Arc::new(Image::from_bytes(format, bytes)))
+            });
+            if self.art_cache.len() >= ART_CACHE_LIMIT && !self.art_cache.contains_key(&result.path)
+            {
+                if let Some(oldest) = self.art_cache.keys().next().cloned() {
+                    self.art_cache.remove(&oldest);
+                }
+            }
+            self.art_cache.insert(result.path, image);
+            dirty = true;
         }
 
         while let Ok(evt) = self.player.events.try_recv() {
@@ -169,6 +276,7 @@ impl FlacBox {
         self.last_status = snap.status;
         self.last_index = snap.index;
         self.snap = snap;
+        self.persist_last_track();
 
         self.update_lyrics(cx);
         self.update_lyrics_position(cx);
@@ -194,7 +302,9 @@ impl FlacBox {
         }
 
         let track = self.current_track().cloned();
-        let identity = track.as_ref().map(|t| t.path.to_string_lossy().to_string());
+        let identity = track
+            .as_ref()
+            .map(|t| format!("{}::{:?}", t.path.to_string_lossy(), self.lyrics_mode));
         if identity == self.lyrics_track {
             return;
         }
@@ -202,7 +312,6 @@ impl FlacBox {
         self.lyrics = None;
         self.lyrics_active = None;
         self.lyrics_key = None;
-        self.lyrics_scroll.set_offset(point(px(0.), px(0.)));
 
         let Some(track) = track else {
             self.lyrics_status = LyricsStatus::Idle;
@@ -211,7 +320,11 @@ impl FlacBox {
         };
 
         self.lyrics_status = LyricsStatus::Loading;
-        let key = flacplayer::lyrics::cache_key(&track.title, &track.artist, &track.album);
+        let key = format!(
+            "{}::{:?}",
+            flacplayer::lyrics::cache_key(&track.title, &track.artist, &track.album),
+            self.lyrics_mode
+        );
         self.lyrics_key = Some(key.clone());
         lyrics::spawn_resolve(
             LyricsRequest {
@@ -222,6 +335,7 @@ impl FlacBox {
                 audio_path: Some(track.path.clone()),
             },
             key,
+            self.lyrics_mode,
             self.lyrics_tx.clone(),
         );
         cx.notify();
@@ -238,9 +352,6 @@ impl FlacBox {
             return;
         }
         self.lyrics_active = active;
-        if let Some(index) = active {
-            self.lyrics_scroll.scroll_to_item(index);
-        }
         cx.notify();
     }
 
@@ -257,37 +368,161 @@ impl FlacBox {
         self.lib.tracks.iter().find(|t| &t.path == path)
     }
 
-    pub fn visible_tracks(&self) -> Vec<usize> {
+    fn restore_session(&mut self) {
+        if self.restored_session {
+            return;
+        }
+        self.restored_session = true;
+        let state = load_app_state();
+        let Some(last) = state.last_track else {
+            return;
+        };
+        let last = PathBuf::from(last);
+        let Some(start) = self.lib.tracks.iter().position(|track| track.path == last) else {
+            return;
+        };
+        self.last_saved_track = Some(last.clone());
+        let paths = vec![self.lib.tracks[start].path.to_string_lossy().to_string()];
+        self.queue = vec![self.lib.tracks[start].path.clone()];
+        self.player.send(Cmd::SetQueue {
+            paths,
+            start: 0,
+            start_ms: state.last_position_ms,
+        });
+    }
+
+    fn persist_last_track(&mut self) {
+        let Some(path) = self.current_track().map(|track| track.path.clone()) else {
+            return;
+        };
+        if self.last_saved_track.as_ref() == Some(&path) {
+            return;
+        }
+        self.last_saved_track = Some(path.clone());
+        let mut state = load_app_state();
+        state.last_track = Some(path.to_string_lossy().to_string());
+        state.last_position_ms = self.snap.position_ms.max(0) as u64;
+        state.playlists = self.playlists.clone();
+        save_app_state(&state);
+    }
+
+    pub fn create_playlist(&mut self) {
+        let name = self.playlist_input.trim();
+        if name.is_empty() || self.playlists.iter().any(|item| item.name == name) {
+            return;
+        }
+        self.playlists.push(PlaylistState {
+            name: name.to_string(),
+            tracks: Vec::new(),
+        });
+        self.playlist_input.clear();
+        self.playlist_modal_open = false;
+        let mut state = load_app_state();
+        state.playlists = self.playlists.clone();
+        save_app_state(&state);
+    }
+
+    pub fn add_to_playlist(&mut self, playlist_name: &str, path: PathBuf) {
+        if let Some(playlist) = self
+            .playlists
+            .iter_mut()
+            .find(|item| item.name == playlist_name)
+        {
+            if !playlist.tracks.contains(&path) {
+                playlist.tracks.push(path);
+            }
+        }
+        self.playlist_menu = None;
+        let mut state = load_app_state();
+        state.playlists = self.playlists.clone();
+        save_app_state(&state);
+    }
+
+    pub fn visible_tracks(&mut self) -> Arc<Vec<usize>> {
+        if self.visible_cache_revision == self.navigation_revision {
+            if let Some(cache) = &self.visible_cache {
+                return Arc::clone(cache);
+            }
+        }
+
         let q = self.search.trim().to_lowercase();
 
         if let Some(drill) = &self.drill {
             if q.is_empty() {
-                return drill.tracks.clone();
+                return self.cache_visible(drill.tracks.clone());
             }
-            return drill
-                .tracks
-                .iter()
-                .copied()
-                .filter(|&i| self.matches(i, &q))
-                .collect();
+            return self.cache_visible(
+                drill
+                    .tracks
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.matches(i, &q))
+                    .collect(),
+            );
         }
 
         let base: Vec<usize> = match self.tab {
             Tab::Songs | Tab::Albums | Tab::Artists => (0..self.lib.tracks.len()).collect(),
         };
 
-        if q.is_empty() {
+        let visible = if q.is_empty() {
             base
         } else {
             base.into_iter().filter(|&i| self.matches(i, &q)).collect()
+        };
+        self.cache_visible(visible)
+    }
+
+    fn cache_visible(&mut self, visible: Vec<usize>) -> Arc<Vec<usize>> {
+        let visible = Arc::new(visible);
+        self.visible_cache = Some(Arc::clone(&visible));
+        self.visible_cache_revision = self.navigation_revision;
+        visible
+    }
+
+    fn invalidate_navigation(&mut self) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
+        self.visible_cache = None;
+    }
+
+    pub fn set_search(&mut self, search: String) {
+        self.search = search;
+        self.invalidate_navigation();
+    }
+
+    pub fn invalidate_search(&mut self) {
+        self.invalidate_navigation();
+    }
+
+    pub fn set_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.drill = None;
+        if tab != Tab::Albums {
+            self.art_cache.clear();
+            self.art_loading.clear();
+        }
+        self.invalidate_navigation();
+    }
+
+    pub fn open_drill(&mut self, drill: Drill) {
+        self.drill = Some(drill);
+        self.invalidate_navigation();
+    }
+
+    pub fn clear_drill(&mut self) {
+        self.drill = None;
+        self.invalidate_navigation();
+    }
+
+    pub fn clear_search(&mut self) {
+        if !self.search.is_empty() {
+            self.search.clear();
+            self.invalidate_navigation();
         }
     }
 
     fn matches(&self, i: usize, q: &str) -> bool {
-        let t = &self.lib.tracks[i];
-        t.title.to_lowercase().contains(q)
-            || t.artist.to_lowercase().contains(q)
-            || t.album.to_lowercase().contains(q)
+        self.lib.tracks[i].search_key.contains(q)
     }
 
     pub fn play_tracks(&mut self, tracks: &[usize], start: usize) {
@@ -299,7 +534,10 @@ impl FlacBox {
             .iter()
             .map(|&i| self.lib.tracks[i].path.to_string_lossy().to_string())
             .collect();
-        self.queue = tracks.iter().map(|&i| self.lib.tracks[i].path.clone()).collect();
+        self.queue = tracks
+            .iter()
+            .map(|&i| self.lib.tracks[i].path.clone())
+            .collect();
         self.player.send(Cmd::SetQueue {
             paths,
             start,
@@ -327,26 +565,50 @@ impl FlacBox {
         }
     }
 
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+        self.muted = self.volume <= 0.0;
+        if !self.muted {
+            self.volume_before_mute = self.volume;
+        }
+        self.player.send(Cmd::SetVolume(self.volume));
+    }
+
+    pub fn toggle_mute(&mut self) {
+        if self.muted || self.volume <= 0.0 {
+            self.muted = false;
+            self.volume = self.volume_before_mute.max(0.1);
+        } else {
+            self.volume_before_mute = self.volume;
+            self.muted = true;
+            self.volume = 0.0;
+        }
+        self.player.send(Cmd::SetVolume(self.volume));
+    }
+
     pub fn art(&mut self, path: &PathBuf) -> Option<Arc<Image>> {
         if let Some(cached) = self.art_cache.get(path) {
             return cached.clone();
         }
-        let image = flacplayer::tags::artwork(path).and_then(|bytes| {
-            let format = if bytes.starts_with(&[0xFF, 0xD8]) {
-                ImageFormat::Jpeg
-            } else if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
-                ImageFormat::Png
-            } else {
-                return None;
-            };
-            Some(Arc::new(Image::from_bytes(format, bytes)))
-        });
-        self.art_cache.insert(path.clone(), image.clone());
-        image
+        if self.art_loading.insert(path.clone()) {
+            let path = path.clone();
+            let tx = self.art_tx.clone();
+            std::thread::Builder::new()
+                .name("flacbox-art".into())
+                .spawn(move || {
+                    let bytes = flacplayer::tags::artwork(&path);
+                    let _ = tx.send(ArtResult { path, bytes });
+                })
+                .ok();
+        }
+        None
     }
 
     pub fn rescan(&mut self, cx: &mut Context<Self>) {
         self.lib.scanning = true;
+        self.art_cache.clear();
+        self.art_loading.clear();
+        self.invalidate_navigation();
         let (tx, rx) = unbounded();
         self.scan_rx = rx;
         library::spawn_scan(self.folders.clone(), tx);
@@ -421,7 +683,7 @@ fn main() {
 impl Render for FlacBox {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body: AnyElement = if self.show_player {
-            views::now_playing(self, cx).into_any_element()
+            views::now_playing(self, cx)
         } else {
             div()
                 .flex()
@@ -432,8 +694,6 @@ impl Render for FlacBox {
                 .into_any_element()
         };
 
-        let player_bar = views::player_bar(self, cx);
-
         div()
             .size_full()
             .flex()
@@ -441,7 +701,10 @@ impl Render for FlacBox {
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
-                if this.search_focus.is_focused(_window) || this.folder_focus.is_focused(_window) {
+                if this.search_focus.is_focused(_window)
+                    || this.folder_focus.is_focused(_window)
+                    || this.playlist_focus.is_focused(_window)
+                {
                     return;
                 }
                 match ev.keystroke.key.as_str() {
@@ -451,34 +714,37 @@ impl Render for FlacBox {
                     "n" => this.player.send(Cmd::Next),
                     "p" => this.player.send(Cmd::Prev),
                     "1" => {
-                        this.tab = Tab::Songs;
-                        this.drill = None;
+                        this.set_tab(Tab::Songs);
                         this.show_player = false;
                     }
                     "2" => {
-                        this.tab = Tab::Albums;
-                        this.drill = None;
+                        this.set_tab(Tab::Albums);
                         this.show_player = false;
                     }
                     "3" => {
-                        this.tab = Tab::Artists;
-                        this.drill = None;
+                        this.set_tab(Tab::Artists);
                         this.show_player = false;
                     }
                     "f" => {
                         this.show_player = !this.show_player;
                     }
+                    "l" => {
+                        this.show_lyrics = !this.show_lyrics;
+                    }
                     "escape" => {
                         if this.add_folder_open {
                             this.add_folder_open = false;
                             this.folder_input.clear();
+                        } else if this.playlist_modal_open {
+                            this.playlist_modal_open = false;
+                            this.playlist_input.clear();
                         } else if this.show_player {
                             this.show_player = false;
                         } else if this.show_queue {
                             this.show_queue = false;
                         } else {
-                            this.drill = None;
-                            this.search.clear();
+                            this.clear_drill();
+                            this.clear_search();
                         }
                     }
                     _ => return,
@@ -486,7 +752,14 @@ impl Render for FlacBox {
                 cx.notify();
             }))
             .child(body)
-            .child(player_bar)
-            .when(self.add_folder_open, |el| el.child(views::add_folder_modal(self, cx)))
+            .when(!self.show_player, |el| {
+                el.child(views::player_bar(self, cx))
+            })
+            .when(self.add_folder_open, |el| {
+                el.child(views::add_folder_modal(self, cx))
+            })
+            .when(self.playlist_modal_open, |el| {
+                el.child(views::create_playlist_modal(self, cx))
+            })
     }
 }

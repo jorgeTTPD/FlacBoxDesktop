@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use oboe::{
     AudioOutputCallback, AudioOutputStreamSafe, AudioStream, AudioStreamAsync, AudioStreamBase,
-    AudioStreamSafe,
-    AudioStreamBuilder, DataCallbackResult, Output, PerformanceMode, SharingMode, Stereo,
+    AudioStreamBuilder, AudioStreamSafe, DataCallbackResult, Output, PerformanceMode, SharingMode,
+    Stereo,
 };
 use rtrb::{Consumer, Producer, RingBuffer};
 

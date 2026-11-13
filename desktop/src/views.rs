@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use gpui::prelude::*;
 use gpui::*;
 
@@ -7,7 +5,7 @@ use flacplayer::engine::Cmd;
 use flacplayer::lyrics::LyricSource;
 use flacplayer::shared::{STATUS_ENDED, STATUS_PAUSED, STATUS_PLAYING};
 
-use crate::lyrics::LyricsStatus;
+use crate::lyrics::{LyricsMode, LyricsStatus};
 use crate::theme::*;
 use crate::{Drill, FlacBox, Tab};
 
@@ -59,8 +57,7 @@ pub fn sidebar(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElemen
             .when(active, |el| el.bg(rgb(SURFACE_HI)))
             .hover(|s| s.bg(rgb(SURFACE_HOVER)))
             .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
-                this.tab = tab;
-                this.drill = None;
+                this.set_tab(tab);
                 cx.notify();
             }))
             .child(icon(
@@ -98,6 +95,18 @@ pub fn sidebar(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElemen
                 .text_size(px(11.5))
                 .text_color(rgb(MUTED))
                 .child(truncate(&name, 26))
+        })
+        .collect::<Vec<_>>();
+    let playlist_rows = this
+        .playlists
+        .iter()
+        .map(|playlist| {
+            div()
+                .px_3()
+                .py_1()
+                .text_size(px(11.5))
+                .text_color(rgb(MUTED))
+                .child(truncate(&playlist.name, 26))
         })
         .collect::<Vec<_>>();
 
@@ -147,6 +156,38 @@ pub fn sidebar(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElemen
                 .flex()
                 .flex_col()
                 .gap_1()
+                .child(
+                    div()
+                        .px_3()
+                        .text_size(px(10.5))
+                        .text_color(rgb(MUTED))
+                        .child("PLAYLISTS"),
+                )
+                .children(playlist_rows)
+                .child(
+                    div()
+                        .id("create-playlist")
+                        .px_3()
+                        .h(px(30.))
+                        .rounded(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+                        .on_click(cx.listener(|this, _ev: &ClickEvent, window, cx| {
+                            this.playlist_modal_open = true;
+                            window.focus(&this.playlist_focus);
+                            cx.notify();
+                        }))
+                        .child(icon("＋", 13., ACCENT))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(rgb(ACCENT))
+                                .child("Crear playlist"),
+                        ),
+                )
                 .child(
                     div()
                         .px_3()
@@ -253,9 +294,28 @@ pub fn main_area(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElem
         .flex()
         .items_center()
         .gap_2()
+        .track_focus(&this.search_focus)
         .cursor_text()
         .on_click(cx.listener(|this, _ev: &ClickEvent, window, cx| {
             window.focus(&this.search_focus);
+            cx.notify();
+        }))
+        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+            match ev.keystroke.key.as_str() {
+                "backspace" => {
+                    this.search.pop();
+                    this.invalidate_search();
+                }
+                "escape" => this.clear_search(),
+                _ => {
+                    if let Some(ch) = &ev.keystroke.key_char {
+                        if !ch.chars().any(|c| c.is_control()) {
+                            this.search.push_str(ch);
+                            this.invalidate_search();
+                        }
+                    }
+                }
+            }
             cx.notify();
         }))
         .child(icon("⌕", 14., MUTED))
@@ -284,7 +344,7 @@ pub fn main_area(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElem
             .cursor_pointer()
             .hover(|s| s.bg(rgb(SURFACE_HOVER)))
             .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
-                this.drill = None;
+                this.clear_drill();
                 cx.notify();
             }))
             .child(icon("‹", 14., MUTED))
@@ -300,7 +360,7 @@ pub fn main_area(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElem
     };
 
     let header = div()
-        .h(px(72.))
+        .h(px(84.))
         .px_6()
         .flex()
         .items_center()
@@ -311,6 +371,7 @@ pub fn main_area(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElem
             div()
                 .flex()
                 .flex_col()
+                .child(back)
                 .child(
                     div()
                         .text_size(px(19.))
@@ -353,10 +414,19 @@ pub fn main_area(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElem
     div()
         .flex()
         .flex_1()
+        .min_w_0()
         .min_h_0()
         .flex_col()
         .child(header)
-        .child(div().flex_1().min_h_0().px_4().pt_2().child(content))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .px_4()
+                .pt_2()
+                .child(content),
+        )
 }
 
 fn duration_long(ms: i64) -> String {
@@ -384,15 +454,41 @@ pub fn songs_list(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> AnyElement {
         .into_any_element();
     }
 
-    uniform_list(
+    let rows = uniform_list(
         "track-list",
         list.len(),
         cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-            range.map(|pos| track_row(this, &list, pos, cx)).collect()
+            range
+                .map(|pos| track_row(this, list.as_slice(), pos, cx))
+                .collect()
         }),
     )
-    .h_full()
-    .into_any_element()
+    .flex_1()
+    .min_h_0();
+
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .h(px(30.))
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_size(px(10.))
+                .text_color(rgb(MUTED))
+                .child(div().w(px(20.)).child("#"))
+                .child(div().w(px(170.)).child("TÍTULO"))
+                .child(div().flex_1().child("ARTISTA"))
+                .child(div().w(px(200.)).child("ÁLBUM"))
+                .child(div().w(px(86.)).child("CALIDAD"))
+                .child(div().w(px(48.)).child("DURACIÓN"))
+                .child(div().w(px(28.)).child("")),
+        )
+        .child(rows)
+        .into_any_element()
 }
 
 fn track_row(
@@ -415,6 +511,36 @@ fn track_row(
 
     let list_owned = list.to_vec();
     let click_list = list_owned.clone();
+    let playlist_path = track.path.clone();
+    let playlist_menu_open = this.playlist_menu.as_ref() == Some(&playlist_path);
+    let playlist_items = this
+        .playlists
+        .iter()
+        .map(|playlist| {
+            let name = playlist.name.clone();
+            let label = name.clone();
+            let path = playlist_path.clone();
+            div()
+                .id(("playlist-item", pos))
+                .h(px(28.))
+                .px_2()
+                .rounded(px(5.))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+                .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+                    this.add_to_playlist(&name, path.clone());
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(TEXT))
+                        .child(truncate(&label, 24)),
+                )
+        })
+        .collect::<Vec<_>>();
 
     div()
         .id(("row", pos))
@@ -477,6 +603,62 @@ fn track_row(
                 .text_color(rgb(MUTED))
                 .child(fmt_time(track.duration_ms as i64)),
         )
+        .child(
+            div()
+                .relative()
+                .w(px(28.))
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .id(("track-menu", pos))
+                        .size(px(26.))
+                        .rounded(px(5.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+                        .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+                            this.playlist_menu =
+                                if this.playlist_menu.as_ref() == Some(&playlist_path) {
+                                    None
+                                } else {
+                                    Some(playlist_path.clone())
+                                };
+                            cx.notify();
+                        }))
+                        .child(div().text_size(px(15.)).text_color(rgb(MUTED)).child("⋯")),
+                )
+                .when(playlist_menu_open, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .right(px(30.))
+                            .top(px(4.))
+                            .w(px(190.))
+                            .p_2()
+                            .rounded(px(8.))
+                            .bg(rgb(SURFACE))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(MUTED))
+                                    .child("Añadir a playlist"),
+                            )
+                            .children(playlist_items),
+                    )
+                }),
+        )
 }
 
 fn empty_state(text: &'static str) -> impl IntoElement {
@@ -496,81 +678,108 @@ fn albums_grid(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElemen
     }
 
     let albums = this.lib.albums.clone();
-    let mut cards = Vec::with_capacity(albums.len());
+    const COLUMNS: usize = 5;
+    let rows = albums.len().div_ceil(COLUMNS);
 
-    for (i, album) in albums.iter().enumerate() {
-        let first = album.tracks.first().copied();
-        let first_path = first.map(|t| this.lib.tracks[t].path.clone());
-        let art = first_path.and_then(|p| this.art(&p));
+    uniform_list(
+        "albums-list",
+        rows,
+        cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+            range
+                .map(|row| {
+                    let start = row * COLUMNS;
+                    let end = (start + COLUMNS).min(albums.len());
+                    let cards = (start..end)
+                        .map(|index| album_card(this, &albums[index], index, cx))
+                        .collect::<Vec<_>>();
+                    div().w_full().flex().gap_5().children(cards)
+                })
+                .collect()
+        }),
+    )
+    .size_full()
+    .pt_3()
+    .into_any_element()
+}
 
-        let cover: AnyElement = match art {
-            Some(image) => img(image)
-                .w_full()
-                .h(px(150.))
-                .rounded(px(8.))
-                .object_fit(ObjectFit::Cover)
-                .into_any_element(),
-            None => div()
-                .w_full()
-                .h(px(150.))
-                .rounded(px(8.))
-                .bg(rgb(SURFACE_HI))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(icon("♫", 26., ACCENT_DIM))
-                .into_any_element(),
-        };
-
-        let tracks = album.tracks.clone();
-        cards.push(
-            div()
-                .id(("album", i))
-                .w(px(150.))
-                .mb_5()
-                .mr_5()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .cursor_pointer()
-                .hover(|s| s.opacity(0.85))
-                .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
-                    let first = this.lib.albums.iter().position(|a| a.tracks == tracks);
-                    let album = first.and_then(|i| this.lib.albums.get(i).cloned());
-                    if let Some(album) = album {
-                        this.drill = Some(Drill {
-                            title: album.name.clone(),
-                            subtitle: album.artist.clone(),
-                            tracks: album.tracks.clone(),
-                        });
-                        this.tab = Tab::Albums;
-                        cx.notify();
-                    }
-                }))
-                .child(cover)
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(rgb(TEXT))
-                        .child(truncate(&album.name, 22)),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED))
-                        .child(truncate(&album.artist, 22)),
-                ),
-        );
-    }
+fn album_card(
+    this: &mut FlacBox,
+    album: &crate::library::Album,
+    index: usize,
+    cx: &mut Context<FlacBox>,
+) -> AnyElement {
+    let first_path = album
+        .tracks
+        .first()
+        .map(|&track| this.lib.tracks[track].path.clone());
+    let art = first_path.and_then(|path| this.art(&path));
+    let cover: AnyElement = match art {
+        Some(image) => img(image)
+            .w(px(176.))
+            .h(px(176.))
+            .rounded(px(8.))
+            .object_fit(ObjectFit::Cover)
+            .into_any_element(),
+        None => div()
+            .w(px(176.))
+            .h(px(176.))
+            .rounded(px(8.))
+            .bg(rgb(SURFACE_HI))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon("♫", 26., ACCENT_DIM))
+            .into_any_element(),
+    };
+    let tracks = album.tracks.clone();
+    let name = album.name.clone();
+    let artist = album.artist.clone();
+    let year = album.year.clone();
+    let track_count = album.tracks.len();
 
     div()
-        .id("albums-scroll")
-        .size_full()
-        .overflow_y_scroll()
+        .id(("album", index))
+        .w(px(176.))
+        .mb_5()
         .flex()
-        .flex_wrap()
-        .pt_3()
-        .children(cards)
+        .flex_col()
+        .gap_2()
+        .cursor_pointer()
+        .hover(|s| s.opacity(0.85))
+        .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+            this.open_drill(Drill {
+                title: name.clone(),
+                subtitle: artist.clone(),
+                tracks: tracks.clone(),
+            });
+            this.tab = Tab::Albums;
+            cx.notify();
+        }))
+        .child(cover)
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(rgb(TEXT))
+                .child(truncate(&album.name, 22)),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(MUTED))
+                .child(truncate(&album.artist, 22)),
+        )
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(ACCENT_DIM))
+                .child(format!(
+                    "{} pistas{}",
+                    track_count,
+                    year.as_deref()
+                        .map(|value| format!(" · {value}"))
+                        .unwrap_or_default()
+                )),
+        )
         .into_any_element()
 }
 
@@ -600,12 +809,12 @@ fn artists_list(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoEleme
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(SURFACE_HOVER)))
                 .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
-                    this.tab = Tab::Artists;
-                    this.drill = Some(Drill {
+                    this.open_drill(Drill {
                         title: click_name.clone(),
                         subtitle: format!("{} álbumes", albums),
                         tracks: click_tracks.clone(),
                     });
+                    this.tab = Tab::Artists;
                     cx.notify();
                 }))
                 .child(icon("☰", 12., MUTED))
@@ -819,6 +1028,27 @@ pub fn player_bar(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoEle
                 .gap_2()
                 .child(
                     div()
+                        .id("mute-btn")
+                        .size(px(30.))
+                        .rounded(px(6.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+                        .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
+                            this.toggle_mute();
+                            cx.notify();
+                        }))
+                        .child(icon(
+                            volume_icon(this),
+                            14.,
+                            if this.muted { MUTED } else { TEXT },
+                        )),
+                )
+                .child(volume_bar(this, cx))
+                .child(
+                    div()
                         .id("queue-btn")
                         .h(px(30.))
                         .px_3()
@@ -905,9 +1135,48 @@ fn seek_bar(
     )
 }
 
+fn volume_icon(this: &FlacBox) -> &'static str {
+    if this.muted || this.volume <= 0.0 {
+        "×"
+    } else if this.volume < 0.5 {
+        "◒"
+    } else {
+        "◉"
+    }
+}
+
+fn volume_bar(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
+    const STEPS: usize = 10;
+    let filled = (this.volume * STEPS as f32).round() as usize;
+    let segments = (0..STEPS)
+        .map(|index| {
+            let value = (index + 1) as f32 / STEPS as f32;
+            div()
+                .id(("volume", index))
+                .w(px(7.))
+                .h(px(14.))
+                .rounded(px(2.))
+                .bg(rgb(if index < filled { ACCENT } else { SURFACE_HI }))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+                    this.set_volume(value);
+                    cx.notify();
+                }))
+        })
+        .collect::<Vec<_>>();
+
+    div()
+        .w(px(84.))
+        .h(px(24.))
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .children(segments)
+}
+
 // ------------------------------------------------------------- now playing
 
-pub fn now_playing(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
+pub fn now_playing(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> AnyElement {
     let current = this.current_track().cloned();
     let art = current.as_ref().and_then(|t| this.art(&t.path));
 
@@ -992,9 +1261,16 @@ pub fn now_playing(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoEl
         .flex_1()
         .min_h_0()
         .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap_6()
+        .p_6()
+        .bg(rgb(BG))
         .child(
             div()
                 .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -1030,10 +1306,12 @@ pub fn now_playing(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoEl
                         .flex_col()
                         .items_center()
                         .gap_1()
+                        .max_w(px(520.))
                         .child(
                             div()
                                 .text_size(px(24.))
                                 .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(TEXT))
                                 .child(title),
                         )
                         .child(
@@ -1127,7 +1405,70 @@ pub fn now_playing(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoEl
                         .child(round_btn("np-repeat", "↻", this.repeat > 0, cx, |this| {
                             this.repeat = (this.repeat + 1) % 3;
                             this.player.send(Cmd::SetRepeat(this.repeat));
-                        })),
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("np-mute-btn")
+                                        .size(px(32.))
+                                        .rounded(px(6.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+                                        .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
+                                            this.toggle_mute();
+                                            cx.notify();
+                                        }))
+                                        .child(icon(
+                                            volume_icon(this),
+                                            15.,
+                                            if this.muted { MUTED } else { TEXT },
+                                        )),
+                                )
+                                .child(volume_bar(this, cx)),
+                        )
+                        .child(
+                            div()
+                                .id("np-lyrics-toggle")
+                                .h(px(32.))
+                                .px_3()
+                                .rounded(px(6.))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .when(this.show_lyrics, |el| el.bg(rgb(ACCENT_DIM)))
+                                .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+                                .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
+                                    this.show_lyrics = !this.show_lyrics;
+                                    cx.notify();
+                                }))
+                                .child(icon(
+                                    "♫",
+                                    15.,
+                                    if this.show_lyrics { ACCENT } else { MUTED },
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(if this.show_lyrics {
+                                            ACCENT
+                                        } else {
+                                            MUTED
+                                        }))
+                                        .child(if this.show_lyrics {
+                                            "Ocultar letras"
+                                        } else {
+                                            "Mostrar letras"
+                                        }),
+                                ),
+                        ),
                 ),
         )
         .when(this.show_queue, |el| {
@@ -1158,13 +1499,18 @@ pub fn now_playing(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoEl
                     ),
             )
         })
-        .child(lyrics_panel(this))
+        .when(this.show_lyrics, |el| el.child(lyrics_panel(this, cx)))
+        .into_any_element()
 }
 
 // ------------------------------------------------------------- letra
 
 /// Recuadro de letra sincronizada, a la derecha de la vista "Ahora suena".
-pub fn lyrics_panel(this: &FlacBox) -> impl IntoElement {
+pub fn lyrics_panel(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
+    let track_title = this
+        .current_track()
+        .map(|track| truncate(&track.title, 30))
+        .unwrap_or_else(|| "Nada sonando".to_string());
     let badge = match this.lyrics.as_ref().map(|l| l.source) {
         Some(LyricSource::Embedded) => "embebida",
         Some(LyricSource::Sidecar) => "archivo .lrc",
@@ -1174,30 +1520,58 @@ pub fn lyrics_panel(this: &FlacBox) -> impl IntoElement {
     };
 
     let lines: Vec<AnyElement> = match this.lyrics.as_ref() {
-        Some(lyrics) if !lyrics.is_empty() => lyrics
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let is_active = lyrics.synced && this.lyrics_active == Some(i);
-                div()
-                    .id(("lyric", i))
-                    .w_full()
-                    .px_2()
-                    .py_2()
-                    .rounded(px(6.))
-                    .when(is_active, |el| el.bg(rgb(SURFACE_HI)))
-                    .text_size(px(if is_active { 15. } else { 13.5 }))
-                    .text_color(rgb(if is_active { ACCENT } else { MUTED }))
-                    .when(is_active, |el| el.font_weight(FontWeight::SEMIBOLD))
-                    .child(if line.text.trim().is_empty() {
-                        "·".to_string()
+        Some(lyrics) if !lyrics.is_empty() => {
+            let active = this.lyrics_active.unwrap_or(0);
+            let window = 3usize;
+            let start = active.saturating_sub(window);
+            let end = (active + window + 1).min(lyrics.lines.len());
+            lyrics
+                .lines
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(end - start)
+                .map(|(i, line)| {
+                    let is_active = lyrics.synced && this.lyrics_active == Some(i);
+                    let distance = this
+                        .lyrics_active
+                        .map(|active| active.abs_diff(i))
+                        .unwrap_or(99);
+                    let color = if is_active {
+                        ACCENT
+                    } else if distance <= 1 {
+                        TEXT
                     } else {
-                        line.text.clone()
-                    })
-                    .into_any_element()
-            })
-            .collect(),
+                        MUTED
+                    };
+                    div()
+                        .id(("lyric", i))
+                        .w_full()
+                        .px_3()
+                        .py_3()
+                        .rounded(px(6.))
+                        .when(is_active, |el| el.bg(rgb(SURFACE_HI)))
+                        .text_size(px(if is_active {
+                            18.
+                        } else if distance <= 1 {
+                            15.
+                        } else {
+                            13.5
+                        }))
+                        .text_color(rgb(color))
+                        .when(!is_active, |el| {
+                            el.opacity(if distance <= 1 { 0.85 } else { 0.58 })
+                        })
+                        .when(is_active, |el| el.font_weight(FontWeight::SEMIBOLD))
+                        .child(if line.text.trim().is_empty() {
+                            "·".to_string()
+                        } else {
+                            line.text.clone()
+                        })
+                        .into_any_element()
+                })
+                .collect()
+        }
         _ => {
             let message = match this.lyrics_status {
                 LyricsStatus::Loading => "Buscando letra…".to_string(),
@@ -1213,36 +1587,81 @@ pub fn lyrics_panel(this: &FlacBox) -> impl IntoElement {
     };
 
     div()
-        .w(px(380.))
-        .flex_shrink_0()
-        .h_full()
+        .flex_1()
+        .min_w_0()
+        .max_w(px(400.))
+        .h(px(560.))
+        .my_6()
         .flex()
         .flex_col()
+        .rounded(px(14.))
         .bg(rgb(SURFACE))
-        .border_l_1()
+        .border_1()
         .border_color(rgb(BORDER))
         .child(
             div()
-                .h(px(44.))
+                .h(px(92.))
                 .flex_shrink_0()
                 .px_4()
                 .flex()
-                .items_center()
-                .justify_between()
+                .flex_col()
+                .items_start()
+                .justify_center()
+                .gap_2()
                 .border_b_1()
                 .border_color(rgb(BORDER))
                 .child(
                     div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(TEXT))
-                        .child("Letra"),
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(ACCENT))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("LETRAS"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT))
+                                        .child(track_title),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_full()
+                                .bg(rgb(ACCENT_DIM))
+                                .text_size(px(10.))
+                                .text_color(rgb(ACCENT))
+                                .child(badge),
+                        ),
                 )
                 .child(
                     div()
-                        .text_size(px(10.))
-                        .text_color(rgb(ACCENT_DIM))
-                        .child(badge),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(lyrics_source_button(LyricsMode::Auto, "Auto", this, cx))
+                        .child(lyrics_source_button(
+                            LyricsMode::Embedded,
+                            "Embebida",
+                            this,
+                            cx,
+                        ))
+                        .child(lyrics_source_button(LyricsMode::Sidecar, ".LRC", this, cx))
+                        .child(lyrics_source_button(LyricsMode::Cache, "Cache", this, cx))
+                        .child(lyrics_source_button(LyricsMode::Online, "Online", this, cx)),
                 ),
         )
         .child(
@@ -1250,15 +1669,177 @@ pub fn lyrics_panel(this: &FlacBox) -> impl IntoElement {
                 .id("lyrics-scroll")
                 .flex_1()
                 .min_h_0()
-                .overflow_y_scroll()
-                .track_scroll(&this.lyrics_scroll)
-                .px_4()
-                .py_4()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .overflow_hidden()
+                .px_5()
+                .py_5()
                 .children(lines),
         )
         .when(this.lyrics_status == LyricsStatus::Loading, |el| {
             el.opacity(0.6)
         })
+}
+
+fn lyrics_source_button(
+    mode: LyricsMode,
+    label: &'static str,
+    this: &mut FlacBox,
+    cx: &mut Context<FlacBox>,
+) -> impl IntoElement {
+    let active = this.lyrics_mode == mode;
+    div()
+        .id(label)
+        .h(px(24.))
+        .px_2()
+        .rounded(px(5.))
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .when(active, |el| el.bg(rgb(ACCENT_DIM)))
+        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+        .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+            this.lyrics_mode = mode;
+            this.lyrics_track = None;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .text_size(px(10.))
+                .text_color(rgb(if active { ACCENT } else { MUTED }))
+                .child(label),
+        )
+}
+
+// ------------------------------------------------------------- modal playlist
+
+pub fn create_playlist_modal(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
+    let input_text = if this.playlist_input.is_empty() {
+        "Nueva playlist".to_string()
+    } else {
+        this.playlist_input.clone()
+    };
+    let color = if this.playlist_input.is_empty() {
+        MUTED
+    } else {
+        TEXT
+    };
+
+    div()
+        .absolute()
+        .inset_0()
+        .bg(rgba(0x00000088))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .w(px(420.))
+                .p_5()
+                .rounded(px(12.))
+                .bg(rgb(SURFACE))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Crear playlist"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(rgb(MUTED))
+                        .child("Dale un nombre para guardarla en tu biblioteca."),
+                )
+                .child(
+                    div()
+                        .id("playlist-input")
+                        .h(px(36.))
+                        .px_3()
+                        .rounded(px(8.))
+                        .bg(rgb(BG))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .flex()
+                        .items_center()
+                        .track_focus(&this.playlist_focus)
+                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
+                            match ev.keystroke.key.as_str() {
+                                "backspace" => {
+                                    this.playlist_input.pop();
+                                }
+                                "escape" => {
+                                    this.playlist_modal_open = false;
+                                    this.playlist_input.clear();
+                                }
+                                "enter" => this.create_playlist(),
+                                _ => {
+                                    if let Some(ch) = &ev.keystroke.key_char {
+                                        if !ch.chars().any(|c| c.is_control()) {
+                                            this.playlist_input.push_str(ch);
+                                        }
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .text_color(rgb(color))
+                                .child(input_text),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("cancel-playlist")
+                                .h(px(32.))
+                                .px_4()
+                                .rounded(px(6.))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+                                .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
+                                    this.playlist_modal_open = false;
+                                    this.playlist_input.clear();
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(MUTED))
+                                        .child("Cancelar"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("save-playlist")
+                                .h(px(32.))
+                                .px_4()
+                                .rounded(px(6.))
+                                .bg(rgb(ACCENT))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
+                                    this.create_playlist();
+                                    cx.notify();
+                                }))
+                                .child(div().text_size(px(12.)).text_color(rgb(BG)).child("Crear")),
+                        ),
+                ),
+        )
 }
 
 // ------------------------------------------------------------- modal carpeta

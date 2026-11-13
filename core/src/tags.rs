@@ -1,6 +1,8 @@
 use std::path::Path;
 
+use lofty::config::ParseOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey};
 
 /// Tags de un fichero de audio, ya interpretados.
@@ -22,7 +24,11 @@ pub struct Tags {
 }
 
 pub fn read(path: &Path) -> Option<Tags> {
-    let tagged = lofty::read_from_path(path).ok()?;
+    let tagged = Probe::open(path)
+        .ok()?
+        .options(ParseOptions::new().read_cover_art(false))
+        .read()
+        .ok()?;
     let props = tagged.properties();
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
 

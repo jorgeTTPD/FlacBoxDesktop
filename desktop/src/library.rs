@@ -1,6 +1,6 @@
+use crossbeam_channel::Sender;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use crossbeam_channel::Sender;
 
 use flacplayer::tags;
 
@@ -23,6 +23,7 @@ pub struct Track {
     pub bits: u8,
     pub channels: u8,
     pub has_art: bool,
+    pub search_key: String,
 }
 
 impl Track {
@@ -81,8 +82,6 @@ impl Library {
                 .then(a.track_no.cmp(&b.track_no))
                 .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
         });
-        self.tracks
-            .sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
 
         let mut album_map: HashMap<(String, String), Album> = HashMap::new();
         let mut artist_map: HashMap<String, Artist> = HashMap::new();
@@ -207,10 +206,12 @@ fn read_track(path: &Path) -> Option<Track> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| artist.clone());
 
+    let title = t.title.filter(|s| !s.trim().is_empty()).unwrap_or(fallback);
+
     Some(Track {
-        title: t.title.filter(|s| !s.trim().is_empty()).unwrap_or(fallback),
-        artist,
-        album,
+        title: title.clone(),
+        artist: artist.clone(),
+        album: album.clone(),
         album_artist,
         year: t.year,
         duration_ms,
@@ -221,6 +222,7 @@ fn read_track(path: &Path) -> Option<Track> {
         channels: t.channels,
         has_art: t.has_art,
         path: path.to_path_buf(),
+        search_key: format!("{title} {artist} {album}").to_lowercase(),
     })
 }
 

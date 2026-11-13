@@ -4,13 +4,13 @@ pub mod engine;
 mod jni_api;
 pub mod lyrics;
 pub mod metadata;
-pub mod player;
-pub mod shared;
-pub mod tags;
 #[cfg(target_os = "android")]
 mod output;
 #[cfg(not(target_os = "android"))]
 mod output_cpal;
+pub mod player;
+pub mod shared;
+pub mod tags;
 
 #[cfg(target_os = "android")]
 mod android_log {
@@ -18,10 +18,10 @@ mod android_log {
 
     extern "C" {
         fn __android_log_write(
-        prio: i32,
-        tag: *const std::os::raw::c_char,
-        text: *const std::os::raw::c_char,
-    ) -> i32;
+            prio: i32,
+            tag: *const std::os::raw::c_char,
+            text: *const std::os::raw::c_char,
+        ) -> i32;
     }
 
     struct AndroidLog;
@@ -54,7 +54,10 @@ mod android_log {
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "system" fn JNI_OnLoad(_vm: jni::JavaVM, _reserved: *mut std::os::raw::c_void) -> jni::sys::jint {
+pub extern "system" fn JNI_OnLoad(
+    _vm: jni::JavaVM,
+    _reserved: *mut std::os::raw::c_void,
+) -> jni::sys::jint {
     android_log::install();
     log::info!("flacplayer nativo cargado");
     jni::sys::JNI_VERSION_1_6
