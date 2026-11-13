@@ -1,6 +1,7 @@
 use gpui::prelude::*;
 use gpui::*;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use flacplayer::engine::Cmd;
 use flacplayer::lyrics::LyricSource;
@@ -504,6 +505,7 @@ fn internet_row(this: &mut FlacBox, index: usize, cx: &mut Context<FlacBox>) -> 
     let art = this.art(&thumb);
     let is_downloading = this.internet.downloading.contains(&id);
     let is_downloaded = this.internet.downloaded.contains(&id);
+    let is_video_downloading = this.internet.downloading_video.contains(&id);
 
     let cover: AnyElement = match art {
         Some(image) => img(image)
@@ -572,22 +574,56 @@ fn internet_row(this: &mut FlacBox, index: usize, cx: &mut Context<FlacBox>) -> 
         )
         .child(
             div()
-                .w(px(92.))
+                .w(px(118.))
                 .flex()
                 .flex_col()
                 .items_end()
-                .gap_1()
+                .gap_2()
                 .child(
                     div()
                         .text_size(px(9.))
-                        .text_color(rgb(if is_downloading { ACCENT } else { MUTED }))
-                        .child(if is_downloading {
+                        .text_color(rgb(if is_downloading || is_video_downloading {
+                            ACCENT
+                        } else {
+                            MUTED
+                        }))
+                        .child(if is_video_downloading {
+                            "DESCARGANDO VIDEO…"
+                        } else if is_downloading {
                             "DESCARGANDO…"
                         } else if is_downloaded {
                             "EN CACHE"
                         } else {
                             "▷"
                         }),
+                )
+                .child(
+                    div().flex().items_center().gap_1().child(
+                        div()
+                            .id(("video-row", index))
+                            .size(px(32.))
+                            .rounded(px(7.))
+                            .bg(rgb(if is_video_downloading {
+                                SURFACE_HOVER
+                            } else {
+                                SURFACE_HI
+                            }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+                            .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+                                cx.stop_propagation();
+                                this.play_video(index);
+                                cx.notify();
+                            }))
+                            .child(icon(
+                                "▣",
+                                14.,
+                                if is_video_downloading { ACCENT } else { TEXT },
+                            )),
+                    ),
                 ),
         )
         .into_any_element()
@@ -1210,10 +1246,161 @@ fn tracks_len(tracks: &[usize]) -> usize {
     tracks.len()
 }
 
+// ------------------------------------------------------------- video
+
+fn video_slot_el(this: &FlacBox, size: f32) -> AnyElement {
+    let Some(video) = &this.video.video else {
+        return div().into_any_element();
+    };
+    let height = size * 0.5625;
+    div()
+        .w(px(size))
+        .h(px(height))
+        .rounded(px(10.))
+        .overflow_hidden()
+        .child(
+            gpui_video_player::video(video.clone())
+                .id("video-np")
+                .buffer_capacity(15)
+                .size(px(size), px(height)),
+        )
+        .into_any_element()
+}
+
+fn video_seek_track(
+    duration: Duration,
+    position: Duration,
+    cx: &mut Context<FlacBox>,
+) -> impl IntoElement {
+    let frac = if duration.as_millis() > 0 {
+        (position.as_millis() as f32 / duration.as_millis() as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    const STEPS: usize = 72;
+    let filled = if frac > 0.0 {
+        ((frac * STEPS as f32).round() as usize).max(1)
+    } else {
+        0
+    };
+
+    let mut segments = Vec::with_capacity(STEPS);
+    for i in 0..STEPS {
+        let frac_step = i as f32 / (STEPS - 1) as f32;
+        let color = if i < filled { ACCENT } else { SURFACE_HI };
+        segments.push(
+            div()
+                .id(("vseek", i))
+                .flex_1()
+                .h_full()
+                .bg(rgb(color))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+                    if let Some(video) = &this.video.video {
+                        let seconds = duration.as_secs_f32() * frac_step;
+                        let _ = video.seek(Duration::from_secs_f32(seconds), false);
+                        cx.notify();
+                    }
+                })),
+        );
+    }
+
+    div()
+        .flex_1()
+        .h(px(6.))
+        .rounded_full()
+        .overflow_hidden()
+        .flex()
+        .children(segments)
+}
+
+fn video_seek_row(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> AnyElement {
+    let (position, duration) = match &this.video.video {
+        Some(video) => (video.position(), video.duration()),
+        None => (Duration::ZERO, Duration::ZERO),
+    };
+    let pos_ms = position.as_millis() as i64;
+    let dur_ms = duration.as_millis() as i64;
+
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(46.))
+                .text_size(px(10.5))
+                .text_color(rgb(MUTED))
+                .child(fmt_time(pos_ms)),
+        )
+        .child(video_seek_track(duration, position, cx))
+        .child(
+            div()
+                .w(px(46.))
+                .flex()
+                .justify_end()
+                .text_size(px(10.5))
+                .text_color(rgb(MUTED))
+                .child(fmt_time(dur_ms)),
+        )
+        .into_any_element()
+}
+
+fn video_transport_row(
+    this: &mut FlacBox,
+    size: f32,
+    cx: &mut Context<FlacBox>,
+) -> impl IntoElement {
+    let paused = this
+        .video
+        .video
+        .as_ref()
+        .map(|video| video.paused())
+        .unwrap_or(true);
+    div().flex().items_center().gap_5().child(circle_transport(
+        "video-play",
+        if paused { "▶" } else { "▮▮" },
+        size,
+        true,
+        cx,
+        |this| {
+            if let Some(video) = &this.video.video {
+                video.set_paused(!video.paused());
+            }
+        },
+    ))
+}
+
+fn seek_area(
+    this: &mut FlacBox,
+    position: i64,
+    duration: i64,
+    thickness: f32,
+    cx: &mut Context<FlacBox>,
+) -> AnyElement {
+    if this.video.active {
+        return video_seek_row(this, cx);
+    }
+    np_seek_row(position, duration, thickness, cx).into_any_element()
+}
+
+fn transport_area(
+    this: &mut FlacBox,
+    playing: bool,
+    size: f32,
+    cx: &mut Context<FlacBox>,
+) -> AnyElement {
+    if this.video.active {
+        return video_transport_row(this, size, cx).into_any_element();
+    }
+    transport_row(playing, size, cx).into_any_element()
+}
+
 // ------------------------------------------------------------- barra inferior
 
 pub fn player_bar(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
-    let current = this.current_track().cloned();
+    let current = this.np_track().cloned();
     let art = current.as_ref().and_then(|t| this.art(&t.path));
 
     let cover: AnyElement = match art {
@@ -1771,20 +1958,47 @@ fn np_top_bar(this: &mut FlacBox, wide: bool, cx: &mut Context<FlacBox>) -> impl
                 ),
         )
         .when(wide, |el| {
-            el.child(
+            el.child(if this.is_internet_current() {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(chip_btn(
+                        "np-audio-btn",
+                        "AUDIO",
+                        "▷",
+                        !this.video.active,
+                        cx,
+                        |this| {
+                            this.start_audio_internet();
+                        },
+                    ))
+                    .child(chip_btn(
+                        "np-video-btn",
+                        "VIDEO",
+                        "▣",
+                        this.video.active,
+                        cx,
+                        |this| {
+                            this.start_video_internet();
+                        },
+                    ))
+                    .into_any_element()
+            } else {
                 div()
                     .text_size(px(10.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(MUTED))
-                    .child("R E P R O D U C I E N D O"),
-            )
+                    .child("R E P R O D U C I E N D O")
+                    .into_any_element()
+            })
         })
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .when(this.lyrics_available(), |el| {
+                .when(this.lyrics_available() && !this.video.active, |el| {
                     el.child(chip_btn(
                         "np-lyrics-btn",
                         "LETRA",
@@ -1796,16 +2010,18 @@ fn np_top_bar(this: &mut FlacBox, wide: bool, cx: &mut Context<FlacBox>) -> impl
                         },
                     ))
                 })
-                .child(chip_btn(
-                    "np-queue-btn",
-                    "COLA",
-                    "☰",
-                    this.show_queue,
-                    cx,
-                    |this| {
-                        this.show_queue = !this.show_queue;
-                    },
-                )),
+                .when(!this.video.active, |el| {
+                    el.child(chip_btn(
+                        "np-queue-btn",
+                        "COLA",
+                        "☰",
+                        this.show_queue,
+                        cx,
+                        |this| {
+                            this.show_queue = !this.show_queue;
+                        },
+                    ))
+                }),
         )
 }
 
@@ -1982,7 +2198,7 @@ fn lyrics_source_row(this: &FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElem
 }
 
 fn lyrics_view(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> AnyElement {
-    let current = this.current_track().cloned();
+    let current = this.np_track().cloned();
     let color = this.current_art_color();
     let position = this.snap.position_ms;
     let duration = this.snap.duration_ms;
@@ -2145,7 +2361,7 @@ fn lyrics_view(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> AnyElement {
 }
 
 fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) -> AnyElement {
-    let current = this.current_track().cloned();
+    let current = this.np_track().cloned();
     let color = this.current_art_color();
     let position = this.snap.position_ms;
     let duration = this.snap.duration_ms;
@@ -2154,7 +2370,7 @@ fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) 
     let w = window.viewport_size().width;
     let wide = w >= px(1060.);
     let mid = !wide && w >= px(720.);
-    let show_queue = this.show_queue && wide;
+    let show_queue = this.show_queue && wide && !this.video.active;
 
     let (title, artist, album, quality) = match &current {
         Some(t) => (
@@ -2217,14 +2433,13 @@ fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) 
                     .min_h_0()
                     .flex()
                     .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(cover_el(this, art_path, 380., 14.)),
-                    )
+                    .child(div().flex_1().flex().items_center().justify_center().child(
+                        if this.video.active {
+                            video_slot_el(this, 640.)
+                        } else {
+                            cover_el(this, art_path, 380., 14.)
+                        },
+                    ))
                     .when(this.lyrics_available(), |el| {
                         el.child(lyrics_panel_el(this))
                     }),
@@ -2265,9 +2480,9 @@ fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) 
                             .flex_col()
                             .items_center()
                             .gap_3()
-                            .child(np_seek_row(position, duration, 6., cx))
-                            .child(transport_row(playing, 68., cx))
-                            .child(secondary_row(this, cx)),
+                            .child(seek_area(this, position, duration, 6., cx))
+                            .child(transport_area(this, playing, 68., cx))
+                            .when(!this.video.active, |el| el.child(secondary_row(this, cx))),
                     ),
             );
         return div()
@@ -2297,7 +2512,11 @@ fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) 
                     .justify_center()
                     .gap_4()
                     .px_6()
-                    .child(cover_el(this, art_path, 240., 12.))
+                    .child(if this.video.active {
+                        video_slot_el(this, 520.)
+                    } else {
+                        cover_el(this, art_path, 240., 12.)
+                    })
                     .child(
                         div()
                             .flex()
@@ -2321,10 +2540,10 @@ fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) 
                     .child(
                         div()
                             .w(px(480.))
-                            .child(np_seek_row(position, duration, 6., cx)),
+                            .child(seek_area(this, position, duration, 6., cx)),
                     )
-                    .child(transport_row(playing, 64., cx))
-                    .child(secondary_row(this, cx)),
+                    .child(transport_area(this, playing, 64., cx))
+                    .when(!this.video.active, |el| el.child(secondary_row(this, cx))),
             )
             .into_any_element();
     }
@@ -2346,7 +2565,11 @@ fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) 
                 .justify_center()
                 .gap_3()
                 .px_4()
-                .child(cover_el(this, art_path, 185., 14.))
+                .child(if this.video.active {
+                    video_slot_el(this, 320.)
+                } else {
+                    cover_el(this, art_path, 185., 14.)
+                })
                 .child(
                     div()
                         .flex()
@@ -2366,9 +2589,9 @@ fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) 
                                 .child(truncate(&artist, 36)),
                         ),
                 )
-                .child(np_seek_row(position, duration, 5., cx))
-                .child(transport_row(playing, 60., cx))
-                .child(secondary_row(this, cx)),
+                .child(seek_area(this, position, duration, 5., cx))
+                .child(transport_area(this, playing, 60., cx))
+                .when(!this.video.active, |el| el.child(secondary_row(this, cx))),
         )
         .into_any_element()
 }

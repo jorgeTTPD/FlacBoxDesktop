@@ -2,6 +2,7 @@ mod internet;
 mod library;
 mod lyrics;
 mod theme;
+mod video;
 mod views;
 
 use std::collections::{HashMap, HashSet};
@@ -22,6 +23,7 @@ use flacplayer::shared::{STATUS_ENDED, STATUS_ERROR, STATUS_PAUSED, STATUS_PLAYI
 
 use internet::{InternetMsg, InternetResult, existing_cached, spawn_download, spawn_search, thumbs_dir};
 use library::{Library, ScanMsg, Track};
+use video::VideoState;
 use lyrics::{LyricsMode, LyricsRequest, LyricsResult, LyricsStatus};
 use theme::*;
 
@@ -121,6 +123,12 @@ pub struct FlacBox {
     pub internet: InternetState,
     pub internet_track: Option<Track>,
     pub internet_titles: HashMap<PathBuf, String>,
+    pub video: VideoState,
+    video_tx: Sender<video::VideoMsg>,
+    video_rx: Receiver<video::VideoMsg>,
+    pending_video: Option<String>,
+    last_video_pos: Option<i64>,
+    internet_url: Option<String>,
     art_loading: HashSet<PathBuf>,
     art_tx: Sender<ArtResult>,
     art_rx: Receiver<ArtResult>,
@@ -157,6 +165,7 @@ pub struct InternetState {
     pub error: Option<String>,
     pub downloading: HashSet<String>,
     pub downloaded: HashSet<String>,
+    pub downloading_video: HashSet<String>,
     pending_play: Option<String>,
     internet_tx: Sender<InternetMsg>,
     internet_rx: Receiver<InternetMsg>,
@@ -171,6 +180,7 @@ impl FlacBox {
         let (lyrics_tx, lyrics_rx) = unbounded();
         let (art_tx, art_rx) = unbounded();
         let (internet_tx, internet_rx) = unbounded();
+        let (video_tx, video_rx) = unbounded();
 
         let mut folders = library::default_folders();
         folders.extend(read_extra_folders());
@@ -226,12 +236,19 @@ impl FlacBox {
                 error: None,
                 downloading: HashSet::new(),
                 downloaded: HashSet::new(),
+                downloading_video: HashSet::new(),
                 pending_play: None,
                 internet_tx,
                 internet_rx,
             },
             internet_track: None,
             internet_titles: HashMap::new(),
+            video: VideoState::new(),
+            video_tx,
+            video_rx,
+            pending_video: None,
+            last_video_pos: None,
+            internet_url: None,
             art_loading: HashSet::new(),
             art_tx,
             art_rx,
@@ -258,6 +275,22 @@ impl FlacBox {
             if !query.trim().is_empty() {
                 this.internet.query = query;
                 this.search_internet();
+            }
+        }
+
+        if let Ok(id) = std::env::var("FLACBOX_VIDEO_ID") {
+            if let Some(path) = video::existing_video(&id) {
+                let result = this.internet.results.iter().find(|result| result.id == id).cloned();
+                let (title, uploader, duration_ms) = result
+                    .map(|r| (r.title, r.uploader, r.duration_ms))
+                    .unwrap_or_else(|| ("Video de prueba".to_string(), "YouTube".to_string(), 0));
+                match video::begin_video(&id, path, title, uploader, duration_ms, &mut this.video) {
+                    Ok(()) => {
+                        this.show_player = true;
+                        this.np_mode = NpMode::Cover;
+                    }
+                    Err(message) => eprintln!("FLACBOX_VIDEO_ID: {message}"),
+                }
             }
         }
 
@@ -321,6 +354,25 @@ impl FlacBox {
             }
         }
 
+        while let Ok(msg) = self.video_rx.try_recv() {
+            match msg {
+                video::VideoMsg::Ready { id, path } => {
+                    self.internet.downloading_video.remove(&id);
+                    if self.pending_video.as_deref() == Some(id.as_str()) {
+                        self.pending_video = None;
+                        self.start_cached_video(id, path);
+                    }
+                    dirty = true;
+                }
+                video::VideoMsg::Failed { id, message } => {
+                    self.internet.downloading_video.remove(&id);
+                    self.pending_video = None;
+                    self.status_line = Some(format!("No se pudo descargar el video: {message}"));
+                    dirty = true;
+                }
+            }
+        }
+
         while let Ok(result) = self.art_rx.try_recv() {
             self.art_loading.remove(&result.path);
             let image = result.bytes.and_then(|bytes| {
@@ -370,6 +422,20 @@ impl FlacBox {
 
         self.update_lyrics(cx);
         self.update_lyrics_position(cx);
+
+        if !self.show_player && self.video.active {
+            self.stop_video();
+        }
+
+        let video_pos = self
+            .video
+            .video
+            .as_ref()
+            .map(|video| video.position().as_millis() as i64);
+        if video_pos != self.last_video_pos {
+            self.last_video_pos = video_pos;
+            dirty = true;
+        }
 
         if dirty {
             cx.notify();
@@ -437,7 +503,11 @@ impl FlacBox {
         if !lyrics.synced {
             return;
         }
-        let active = lyrics.active_index(self.snap.position_ms);
+        let position_ms = match &self.video.video {
+            Some(video) => video.position().as_millis() as i64,
+            None => self.snap.position_ms,
+        };
+        let active = lyrics.active_index(position_ms);
         if active == self.lyrics_active {
             return;
         }
@@ -666,6 +736,7 @@ impl FlacBox {
         };
         let id = result.id.clone();
         let url = result.url.clone();
+        self.internet_url = Some(url.clone());
         if let Some(path) = existing_cached(&id) {
             self.play_cached_internet(id, path);
             return;
@@ -747,6 +818,120 @@ impl FlacBox {
 
     pub fn internet_thumb(&self, id: &str) -> PathBuf {
         thumbs_dir().join(format!("{id}.jpg"))
+    }
+
+    pub fn np_track(&self) -> Option<&Track> {
+        if let Some(track) = &self.video.track {
+            return Some(track);
+        }
+        self.current_track()
+    }
+
+    pub fn is_internet_current(&self) -> bool {
+        self.np_track().is_some_and(|track| track.album == "YouTube")
+    }
+
+    /// Vuelve a reproducir el audio (M4A) de la pista actual de Internet.
+    pub fn start_audio_internet(&mut self) {
+        let Some(track) = self.np_track().cloned() else {
+            return;
+        };
+        let Some(id) = internet_id_of(&track) else {
+            return;
+        };
+        self.stop_video();
+        if let Some(path) = existing_cached(&id) {
+            let paths = vec![path.to_string_lossy().to_string()];
+            self.queue = vec![path];
+            self.player.send(Cmd::SetQueue {
+                paths,
+                start: 0,
+                start_ms: 0,
+            });
+            self.player.send(Cmd::Play);
+            return;
+        }
+        if let Some(url) = &self.internet_url {
+            let url = url.clone();
+            self.internet.downloading.insert(id.clone());
+            self.internet.pending_play = Some(id.clone());
+            spawn_download(id, url, self.internet.internet_tx.clone());
+        }
+    }
+
+    /// Reproduce el video de la pista actual de Internet.
+    pub fn start_video_internet(&mut self) {
+        let Some(track) = self.np_track().cloned() else {
+            return;
+        };
+        let Some(id) = internet_id_of(&track) else {
+            return;
+        };
+        self.stop_video();
+        if let Some(path) = video::existing_video(&id) {
+            self.start_cached_video(id, path);
+            return;
+        }
+        if let Some(url) = &self.internet_url {
+            let url = url.clone();
+            self.player.send(Cmd::Stop);
+            self.internet.downloading_video.insert(id.clone());
+            self.pending_video = Some(id.clone());
+            video::spawn_download_video(id, url, self.video_tx.clone());
+        }
+    }
+
+    pub fn play_video(&mut self, index: usize) {
+        let Some(result) = self.internet.results.get(index).cloned() else {
+            return;
+        };
+        let id = result.id.clone();
+        let url = result.url.clone();
+        self.internet_url = Some(url.clone());
+        if let Some(path) = video::existing_video(&id) {
+            self.start_cached_video(id, path);
+            return;
+        }
+        self.internet.downloading_video.insert(id.clone());
+        self.pending_video = Some(id.clone());
+        video::spawn_download_video(id, url, self.video_tx.clone());
+    }
+
+    fn start_cached_video(&mut self, id: String, path: PathBuf) {
+        let Some(result) = self
+            .internet
+            .results
+            .iter()
+            .find(|result| result.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        self.player.send(Cmd::Stop);
+        let title = result.title.clone();
+        match video::begin_video(
+            &id,
+            path,
+            title,
+            result.uploader,
+            result.duration_ms,
+            &mut self.video,
+        ) {
+            Ok(()) => {
+                self.show_player = true;
+                self.np_mode = NpMode::Cover;
+                self.status_line = None;
+            }
+            Err(message) => {
+                self.status_line = Some(message);
+            }
+        }
+    }
+
+    pub fn stop_video(&mut self) {
+        self.video.video = None;
+        self.video.track = None;
+        self.video.active = false;
     }
 
     pub fn play_tracks(&mut self, tracks: &[usize], start: usize) {
@@ -949,6 +1134,13 @@ fn dominant_color(bytes: &[u8]) -> Option<u32> {
     Some((((r / wsum).round() as u32) << 16) | (((g / wsum).round() as u32) << 8) | (b / wsum).round() as u32)
 }
 
+fn internet_id_of(track: &Track) -> Option<String> {
+    track
+        .path
+        .file_stem()
+        .and_then(|stem| stem.to_str().map(String::from))
+}
+
 fn config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".config/flacbox/folders")
@@ -1056,13 +1248,15 @@ impl Render for FlacBox {
                         this.show_player = !this.show_player;
                     }
                     "l" => {
-                        if this.show_player {
+                        if this.show_player && !this.video.active {
                             this.toggle_np_mode();
                         }
                     }
                     "escape" => {
                         if this.playlist_menu.is_some() {
                             this.playlist_menu = None;
+                        } else if this.video.active {
+                            this.stop_video();
                         } else if this.add_folder_open {
                             this.add_folder_open = false;
                             this.folder_input.clear();

@@ -167,7 +167,7 @@ pub fn spawn_download(id: String, url: String, tx: Sender<InternetMsg>) {
         .ok();
 }
 
-fn wait_with_timeout(mut child: Child, timeout: Duration) -> Result<(String, String), String> {
+pub(crate) fn wait_with_timeout(mut child: Child, timeout: Duration) -> Result<(String, String), String> {
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {

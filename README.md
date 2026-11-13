@@ -11,7 +11,7 @@ Comparte el mismo motor que la versión Android: decodificación con Symphonia (
 - Barra inferior con carátula, título, artista, tiempo y seek.
 - Vista "Ahora suena" a pantalla completa: portada (estilo Spotify) con letras sincronizadas al lado en ventanas anchas, y reflow a formato vertical al estrechar la ventana (mosaico bspwm/sway). `l` alterna el modo letras a pantalla completa (estilo Pixel Player) con fondo derivado del color dominante de la carátula.
 - Carpetas de música: por defecto `~/Música` y `~/Music`; puedes añadir más y quedan guardadas en `~/.config/flacbox/folders`.
-- **Internet** (pestaña, tecla `4`): búsqueda en YouTube vía `yt-dlp`, resultados con miniatura/duración/vistas; click → descarga `bestaudio` al cache (`~/.cache/flacbox/streams`) y suena como archivo local (seek, duración, shuffle, cola, portada de la miniatura y letras LRCLIB incluidos). Requiere `yt-dlp` (`pacman -S yt-dlp`).
+- **Internet** (pestaña, tecla `4`): búsqueda en YouTube vía `yt-dlp`, resultados con miniatura/duración/vistas. Botón ▷ → descarga `bestaudio` al cache (`~/.cache/flacbox/streams`) y suena como archivo local (seek, duración, shuffle, cola, portada de la miniatura y letras LRCLIB). Botón ▣ → descarga el video (`bestvideo+bestaudio` 480p, merge mkv/mp4) y **lo reproduce dentro de «Ahora suena»** (vídeo integrado en la app, audio vía GStreamer). Requiere `yt-dlp` (`pacman -S yt-dlp`); **el video integrado además requiere GStreamer 1.14+** con plugins base/good(+bad/libav para H.264/AV1) (`pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav`).
 - Nota legal: YouTube no licencia oficialmente el streaming por su API para clientes no oficiales; esto es para uso personal.
 - Salida de audio por ALSA/PipeWire vía `cpal`.
 - Letra sincronizada en la vista "Ahora suena", con auto-scroll a la línea activa.
@@ -22,7 +22,7 @@ La vista "Ahora suena" (`f`) muestra un recuadro de letra a la derecha, sincroni
 
 ## Desarrollo
 
-Variables de entorno para pruebas visuales: `FLACBOX_START_VIEW=albums|artists|internet` (pestaña inicial), `FLACBOX_START_PLAYER=1` (abre directamente "Ahora suena"), `FLACBOX_START_MODE=lyrics` (muestra el modo letras), `FLACBOX_START_QUERY="tu búsqueda"` (busca automáticamente en Internet al abrir). Cache de streams: `~/.cache/flacbox/streams` (o `FLACBOX_STREAMS_DIR`).
+Variables de entorno para pruebas visuales: `FLACBOX_START_VIEW=albums|artists|internet` (pestaña inicial), `FLACBOX_START_PLAYER=1` (abre directamente "Ahora suena"), `FLACBOX_START_MODE=lyrics` (muestra el modo letras), `FLACBOX_START_QUERY="tu búsqueda"` (busca automáticamente en Internet al abrir), `FLACBOX_VIDEO_ID=<id-de-video>` (arranca con ese video de Internet en «Ahora suena», si ya está en cache). Cache de streams: `~/.cache/flacbox/streams` (o `FLACBOX_STREAMS_DIR`).
 
 Orden de resolución (mismo criterio que los scripts de Python de `lyrics-on-panel` y `repMusic`, portado a Rust):
 
