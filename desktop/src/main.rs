@@ -1,3 +1,4 @@
+mod internet;
 mod library;
 mod lyrics;
 mod theme;
@@ -19,11 +20,13 @@ use flacplayer::lyrics::Lyrics;
 use flacplayer::player::{Player, Snapshot};
 use flacplayer::shared::{STATUS_ENDED, STATUS_ERROR, STATUS_PAUSED, STATUS_PLAYING};
 
+use internet::{InternetMsg, InternetResult, existing_cached, spawn_download, spawn_search, thumbs_dir};
 use library::{Library, ScanMsg, Track};
 use lyrics::{LyricsMode, LyricsRequest, LyricsResult, LyricsStatus};
 use theme::*;
 
-const ART_CACHE_LIMIT: usize = 24;
+const ART_CACHE_LIMIT: usize = 12;
+const ART_MAX_SIDE: u32 = 384;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct AppState {
@@ -65,11 +68,19 @@ fn save_app_state(state: &AppState) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum NpMode {
+    #[default]
+    Cover,
+    Lyrics,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Songs,
     Albums,
     Artists,
+    Internet,
 }
 
 pub struct Drill {
@@ -96,7 +107,7 @@ pub struct FlacBox {
     volume_before_mute: f32,
     pub show_queue: bool,
     pub show_player: bool,
-    pub show_lyrics: bool,
+    pub np_mode: NpMode,
     pub playlists: Vec<PlaylistState>,
     pub playlist_menu: Option<PathBuf>,
     pub playlist_modal_open: bool,
@@ -106,6 +117,10 @@ pub struct FlacBox {
     pub folder_input: String,
     pub folder_focus: FocusHandle,
     pub art_cache: HashMap<PathBuf, Option<Arc<Image>>>,
+    art_colors: HashMap<PathBuf, Option<u32>>,
+    pub internet: InternetState,
+    pub internet_track: Option<Track>,
+    pub internet_titles: HashMap<PathBuf, String>,
     art_loading: HashSet<PathBuf>,
     art_tx: Sender<ArtResult>,
     art_rx: Receiver<ArtResult>,
@@ -131,6 +146,20 @@ pub struct FlacBox {
 struct ArtResult {
     path: PathBuf,
     bytes: Option<Vec<u8>>,
+    color: Option<u32>,
+}
+
+pub struct InternetState {
+    pub focus: FocusHandle,
+    pub query: String,
+    pub results: Vec<InternetResult>,
+    pub searching: bool,
+    pub error: Option<String>,
+    pub downloading: HashSet<String>,
+    pub downloaded: HashSet<String>,
+    pending_play: Option<String>,
+    internet_tx: Sender<InternetMsg>,
+    internet_rx: Receiver<InternetMsg>,
 }
 
 impl FlacBox {
@@ -141,6 +170,7 @@ impl FlacBox {
         let (tx, rx) = unbounded();
         let (lyrics_tx, lyrics_rx) = unbounded();
         let (art_tx, art_rx) = unbounded();
+        let (internet_tx, internet_rx) = unbounded();
 
         let mut folders = library::default_folders();
         folders.extend(read_extra_folders());
@@ -148,7 +178,7 @@ impl FlacBox {
 
         library::spawn_scan(folders.clone(), tx);
 
-        let this = Self {
+        let mut this = Self {
             player,
             lib: Library {
                 scanning: true,
@@ -159,6 +189,7 @@ impl FlacBox {
             tab: match start.as_str() {
                 "albums" => Tab::Albums,
                 "artists" => Tab::Artists,
+                "internet" => Tab::Internet,
                 _ => Tab::Songs,
             },
             drill: None,
@@ -172,8 +203,11 @@ impl FlacBox {
             muted: false,
             volume_before_mute: 1.0,
             show_queue: start == "queue",
-            show_player: false,
-            show_lyrics: true,
+            show_player: std::env::var_os("FLACBOX_START_PLAYER").is_some(),
+            np_mode: match std::env::var("FLACBOX_START_MODE").ok().as_deref() {
+                Some("lyrics") => NpMode::Lyrics,
+                _ => NpMode::Cover,
+            },
             playlists: saved.playlists,
             playlist_menu: None,
             playlist_modal_open: false,
@@ -183,6 +217,21 @@ impl FlacBox {
             folder_input: String::new(),
             folder_focus: cx.focus_handle(),
             art_cache: HashMap::new(),
+            art_colors: HashMap::new(),
+            internet: InternetState {
+                focus: cx.focus_handle(),
+                query: String::new(),
+                results: Vec::new(),
+                searching: false,
+                error: None,
+                downloading: HashSet::new(),
+                downloaded: HashSet::new(),
+                pending_play: None,
+                internet_tx,
+                internet_rx,
+            },
+            internet_track: None,
+            internet_titles: HashMap::new(),
             art_loading: HashSet::new(),
             art_tx,
             art_rx,
@@ -204,6 +253,13 @@ impl FlacBox {
             restored_session: false,
             last_saved_track: None,
         };
+
+        if let Ok(query) = std::env::var("FLACBOX_START_QUERY") {
+            if !query.trim().is_empty() {
+                this.internet.query = query;
+                this.search_internet();
+            }
+        }
 
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
@@ -233,6 +289,38 @@ impl FlacBox {
             }
         }
 
+        while let Ok(msg) = self.internet.internet_rx.try_recv() {
+            match msg {
+                InternetMsg::SearchDone(results) => {
+                    self.internet.searching = false;
+                    self.internet.results = results;
+                    dirty = true;
+                }
+                InternetMsg::SearchError(message) => {
+                    self.internet.searching = false;
+                    self.internet.error = Some(message.clone());
+                    self.status_line = Some(message);
+                    dirty = true;
+                }
+                InternetMsg::DownloadDone { id, path } => {
+                    self.internet.downloading.remove(&id);
+                    self.internet.downloaded.insert(id.clone());
+                    if self.internet.pending_play.as_deref() == Some(id.as_str()) {
+                        self.internet.pending_play = None;
+                        self.play_cached_internet(id, path);
+                    }
+                    dirty = true;
+                }
+                InternetMsg::DownloadError { id, message } => {
+                    self.internet.downloading.remove(&id);
+                    self.internet.pending_play = None;
+                    self.internet.error = Some(message.clone());
+                    self.status_line = Some(format!("No se pudo descargar: {message}"));
+                    dirty = true;
+                }
+            }
+        }
+
         while let Ok(result) = self.art_rx.try_recv() {
             self.art_loading.remove(&result.path);
             let image = result.bytes.and_then(|bytes| {
@@ -249,8 +337,10 @@ impl FlacBox {
             {
                 if let Some(oldest) = self.art_cache.keys().next().cloned() {
                     self.art_cache.remove(&oldest);
+                    self.art_colors.remove(&oldest);
                 }
             }
+            self.art_colors.insert(result.path.clone(), result.color);
             self.art_cache.insert(result.path, image);
             dirty = true;
         }
@@ -365,7 +455,10 @@ impl FlacBox {
             return None;
         }
         let path = self.queue.get(idx as usize)?;
-        self.lib.tracks.iter().find(|t| &t.path == path)
+        if let Some(track) = self.lib.tracks.iter().find(|track| &track.path == path) {
+            return Some(track);
+        }
+        self.internet_track.as_ref().filter(|track| &track.path == path)
     }
 
     fn restore_session(&mut self) {
@@ -395,6 +488,9 @@ impl FlacBox {
         let Some(path) = self.current_track().map(|track| track.path.clone()) else {
             return;
         };
+        if !self.lib.tracks.iter().any(|track| track.path == path) {
+            return;
+        }
         if self.last_saved_track.as_ref() == Some(&path) {
             return;
         }
@@ -408,7 +504,11 @@ impl FlacBox {
 
     pub fn create_playlist(&mut self) {
         let name = self.playlist_input.trim();
-        if name.is_empty() || self.playlists.iter().any(|item| item.name == name) {
+        if name.is_empty() {
+            return;
+        }
+        if self.playlists.iter().any(|item| item.name == name) {
+            self.status_line = Some(format!("Ya existe una playlist llamada \"{name}\""));
             return;
         }
         self.playlists.push(PlaylistState {
@@ -462,7 +562,9 @@ impl FlacBox {
         }
 
         let base: Vec<usize> = match self.tab {
-            Tab::Songs | Tab::Albums | Tab::Artists => (0..self.lib.tracks.len()).collect(),
+            Tab::Songs | Tab::Albums | Tab::Artists | Tab::Internet => {
+                (0..self.lib.tracks.len()).collect()
+            }
         };
 
         let visible = if q.is_empty() {
@@ -499,6 +601,7 @@ impl FlacBox {
         self.drill = None;
         if tab != Tab::Albums {
             self.art_cache.clear();
+            self.art_colors.clear();
             self.art_loading.clear();
         }
         self.invalidate_navigation();
@@ -507,6 +610,27 @@ impl FlacBox {
     pub fn open_drill(&mut self, drill: Drill) {
         self.drill = Some(drill);
         self.invalidate_navigation();
+    }
+
+    pub fn open_playlist(&mut self, index: usize) {
+        let Some(playlist) = self.playlists.get(index) else {
+            return;
+        };
+        let name = playlist.name.clone();
+        let tracks: Vec<usize> = playlist
+            .tracks
+            .iter()
+            .filter_map(|path| self.lib.tracks.iter().position(|track| &track.path == path))
+            .collect();
+        if tracks.is_empty() {
+            self.status_line = Some(format!("La playlist \"{name}\" está vacía"));
+            return;
+        }
+        self.open_drill(Drill {
+            title: name,
+            subtitle: "Playlist".to_string(),
+            tracks,
+        });
     }
 
     pub fn clear_drill(&mut self) {
@@ -523,6 +647,106 @@ impl FlacBox {
 
     fn matches(&self, i: usize, q: &str) -> bool {
         self.lib.tracks[i].search_key.contains(q)
+    }
+
+    pub fn search_internet(&mut self) {
+        let query = self.internet.query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.internet.searching = true;
+        self.internet.error = None;
+        self.internet.results.clear();
+        spawn_search(query, self.internet.internet_tx.clone());
+    }
+
+    pub fn play_internet(&mut self, index: usize) {
+        let Some(result) = self.internet.results.get(index) else {
+            return;
+        };
+        let id = result.id.clone();
+        let url = result.url.clone();
+        if let Some(path) = existing_cached(&id) {
+            self.play_cached_internet(id, path);
+            return;
+        }
+        self.internet.downloading.insert(id.clone());
+        self.internet.pending_play = Some(id.clone());
+        spawn_download(id, url, self.internet.internet_tx.clone());
+    }
+
+    fn play_cached_internet(&mut self, id: String, path: PathBuf) {
+        let Some(result) = self
+            .internet
+            .results
+            .iter()
+            .find(|result| result.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        let title = result.title.clone();
+        if let Ok(bytes) = std::fs::read(thumbs_dir().join(format!("{id}.jpg"))) {
+            let color = dominant_color(&bytes);
+            let bytes = shrink_art(&bytes);
+            let format = if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+                ImageFormat::Png
+            } else {
+                ImageFormat::Jpeg
+            };
+            self.art_cache
+                .insert(path.clone(), Some(Arc::new(Image::from_bytes(format, bytes))));
+            self.art_colors.insert(path.clone(), color);
+        }
+        let track = Track {
+            path: path.clone(),
+            title: title.clone(),
+            artist: result.uploader,
+            album: "YouTube".to_string(),
+            album_artist: String::new(),
+            year: None,
+            duration_ms: result.duration_ms,
+            track_no: 0,
+            disc_no: 0,
+            sample_rate: 0,
+            bits: 0,
+            channels: 2,
+            has_art: true,
+            search_key: title.to_lowercase(),
+        };
+        self.internet_titles.insert(path.clone(), title);
+        self.internet_track = Some(track);
+        self.internet.downloaded.insert(id);
+        self.queue = vec![path.clone()];
+        let paths = vec![path.to_string_lossy().to_string()];
+        self.player.send(Cmd::SetQueue {
+            paths,
+            start: 0,
+            start_ms: 0,
+        });
+        self.player.send(Cmd::Play);
+        self.status_line = None;
+    }
+
+    pub fn queue_label(&self, index: usize) -> String {
+        let Some(path) = self.queue.get(index) else {
+            return String::new();
+        };
+        if let Some(title) = self.internet_titles.get(path) {
+            return title.clone();
+        }
+        if let Some(track) = &self.internet_track {
+            if &track.path == path {
+                return track.title.clone();
+            }
+        }
+        path.file_stem()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn internet_thumb(&self, id: &str) -> PathBuf {
+        thumbs_dir().join(format!("{id}.jpg"))
     }
 
     pub fn play_tracks(&mut self, tracks: &[usize], start: usize) {
@@ -586,6 +810,27 @@ impl FlacBox {
         self.player.send(Cmd::SetVolume(self.volume));
     }
 
+    pub fn current_art_color(&self) -> Option<u32> {
+        let path = self.current_track().map(|track| track.path.clone())?;
+        self.art_colors.get(&path).copied().flatten()
+    }
+
+    pub fn lyrics_available(&self) -> bool {
+        self.lyrics
+            .as_ref()
+            .is_some_and(|lyrics| lyrics.synced && !lyrics.is_empty())
+    }
+
+    pub fn toggle_np_mode(&mut self) {
+        if !self.lyrics_available() {
+            return;
+        }
+        self.np_mode = match self.np_mode {
+            NpMode::Cover => NpMode::Lyrics,
+            NpMode::Lyrics => NpMode::Cover,
+        };
+    }
+
     pub fn art(&mut self, path: &PathBuf) -> Option<Arc<Image>> {
         if let Some(cached) = self.art_cache.get(path) {
             return cached.clone();
@@ -596,8 +841,18 @@ impl FlacBox {
             std::thread::Builder::new()
                 .name("flacbox-art".into())
                 .spawn(move || {
-                    let bytes = flacplayer::tags::artwork(&path);
-                    let _ = tx.send(ArtResult { path, bytes });
+                    let is_image = matches!(
+                        path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase()).as_deref(),
+                        Some("jpg") | Some("jpeg") | Some("png")
+                    );
+                    let bytes = if is_image {
+                        std::fs::read(&path).ok()
+                    } else {
+                        flacplayer::tags::artwork(&path)
+                    };
+                    let color = bytes.as_deref().and_then(dominant_color);
+                    let bytes = bytes.map(|bytes| shrink_art(&bytes));
+                    let _ = tx.send(ArtResult { path, bytes, color });
                 })
                 .ok();
         }
@@ -607,6 +862,7 @@ impl FlacBox {
     pub fn rescan(&mut self, cx: &mut Context<Self>) {
         self.lib.scanning = true;
         self.art_cache.clear();
+        self.art_colors.clear();
         self.art_loading.clear();
         self.invalidate_navigation();
         let (tx, rx) = unbounded();
@@ -616,15 +872,81 @@ impl FlacBox {
     }
 
     pub fn add_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if !path.is_dir() || self.folders.contains(&path) {
+        if !path.is_dir() {
+            self.status_line = Some(format!(
+                "La carpeta no existe o no es un directorio: {}",
+                path.display()
+            ));
+            return;
+        }
+        if self.folders.contains(&path) {
+            self.status_line = Some("Esa carpeta ya está añadida".to_string());
             return;
         }
         self.folders.push(path);
         write_extra_folders(&self.folders);
         self.add_folder_open = false;
         self.folder_input.clear();
+        self.status_line = None;
         self.rescan(cx);
     }
+}
+
+fn shrink_art(bytes: &[u8]) -> Vec<u8> {
+    let img = match image::load_from_memory(bytes) {
+        Ok(img) => img,
+        Err(_) => return bytes.to_vec(),
+    };
+    let (w, h) = (img.width(), img.height());
+    let max = w.max(h);
+    if max <= ART_MAX_SIDE {
+        return bytes.to_vec();
+    }
+    let ratio = ART_MAX_SIDE as f32 / max as f32;
+    let nw = ((w as f32 * ratio).round() as u32).max(1);
+    let nh = ((h as f32 * ratio).round() as u32).max(1);
+    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    let mut out = std::io::Cursor::new(Vec::new());
+    match resized.write_to(&mut out, image::ImageFormat::Png) {
+        Ok(()) => out.into_inner(),
+        Err(_) => bytes.to_vec(),
+    }
+}
+
+fn dominant_color(bytes: &[u8]) -> Option<u32> {
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (width, height) = img.dimensions();
+    let total = width as usize * height as usize;
+    let step = (total / 1500).max(1);
+    let mut r = 0.0f64;
+    let mut g = 0.0f64;
+    let mut b = 0.0f64;
+    let mut wsum = 0.0f64;
+    for (i, pixel) in img.pixels().enumerate() {
+        if i % step != 0 {
+            continue;
+        }
+        let [pr, pg, pb, pa] = pixel.0;
+        if pa < 128 {
+            continue;
+        }
+        let max = pr.max(pg).max(pb) as f64;
+        let min = pr.min(pg).min(pb) as f64;
+        let sat = if max <= 0.0 { 0.0 } else { (max - min) / max };
+        let weight = if sat > 0.12 && max > 30.0 {
+            0.25 + sat
+        } else {
+            0.08
+        };
+        r += pr as f64 * weight;
+        g += pg as f64 * weight;
+        b += pb as f64 * weight;
+        wsum += weight;
+    }
+    if wsum == 0.0 {
+        return None;
+    }
+    Some((((r / wsum).round() as u32) << 16) | (((g / wsum).round() as u32) << 8) | (b / wsum).round() as u32)
 }
 
 fn config_path() -> PathBuf {
@@ -681,9 +1003,9 @@ fn main() {
 }
 
 impl Render for FlacBox {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body: AnyElement = if self.show_player {
-            views::now_playing(self, cx)
+            views::now_playing(self, window, cx)
         } else {
             div()
                 .flex()
@@ -704,6 +1026,7 @@ impl Render for FlacBox {
                 if this.search_focus.is_focused(_window)
                     || this.folder_focus.is_focused(_window)
                     || this.playlist_focus.is_focused(_window)
+                    || this.internet.focus.is_focused(_window)
                 {
                     return;
                 }
@@ -725,21 +1048,33 @@ impl Render for FlacBox {
                         this.set_tab(Tab::Artists);
                         this.show_player = false;
                     }
+                    "4" => {
+                        this.set_tab(Tab::Internet);
+                        this.show_player = false;
+                    }
                     "f" => {
                         this.show_player = !this.show_player;
                     }
                     "l" => {
-                        this.show_lyrics = !this.show_lyrics;
+                        if this.show_player {
+                            this.toggle_np_mode();
+                        }
                     }
                     "escape" => {
-                        if this.add_folder_open {
+                        if this.playlist_menu.is_some() {
+                            this.playlist_menu = None;
+                        } else if this.add_folder_open {
                             this.add_folder_open = false;
                             this.folder_input.clear();
                         } else if this.playlist_modal_open {
                             this.playlist_modal_open = false;
                             this.playlist_input.clear();
                         } else if this.show_player {
-                            this.show_player = false;
+                            if this.np_mode == NpMode::Lyrics {
+                                this.np_mode = NpMode::Cover;
+                            } else {
+                                this.show_player = false;
+                            }
                         } else if this.show_queue {
                             this.show_queue = false;
                         } else {

@@ -1769,6 +1769,7 @@ dependencies = [
  "crossbeam-channel",
  "flacplayer",
  "gpui",
+ "image",
  "libc",
  "serde",
  "serde_json",

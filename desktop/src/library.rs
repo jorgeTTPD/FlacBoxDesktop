@@ -35,6 +35,9 @@ impl Track {
             .unwrap_or("")
             .to_uppercase();
         let ext = if ext == "M4A" { "AAC".to_string() } else { ext };
+        if self.sample_rate == 0 {
+            return format!("{ext} · YOUTUBE");
+        }
         if self.bits > 0 {
             format!("{} {}/{}", ext, self.bits, self.sample_rate / 1000)
         } else {
