@@ -267,3 +267,51 @@ fn parse_result_line(line: &str) -> Option<InternetResult> {
         url,
     })
 }
+
+pub enum LocalVideoSearchMsg {
+    Results(Vec<InternetResult>),
+    Failed(String),
+}
+
+pub fn spawn_video_search(query: String, tx: Sender<LocalVideoSearchMsg>) {
+    thread::Builder::new()
+        .name("flacbox-yt-vsearch".into())
+        .spawn(move || {
+            let arg = format!("ytsearch10:{query}");
+            let child = Command::new("yt-dlp")
+                .args([
+                    "--flat-playlist",
+                    "--dump-json",
+                    "--no-warnings",
+                    "--",
+                    &arg,
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            let child = match child {
+                Ok(child) => child,
+                Err(err) => {
+                    let _ = tx.send(LocalVideoSearchMsg::Failed(format!(
+                        "no se pudo ejecutar yt-dlp: {err}"
+                    )));
+                    return;
+                }
+            };
+            match wait_with_timeout(child, SEARCH_TIMEOUT) {
+                Ok((stdout, stderr)) => {
+                    let results = parse_search_json(&stdout);
+                    spawn_thumbs(&results);
+                    if results.is_empty() && !stderr.trim().is_empty() {
+                        let _ = tx.send(LocalVideoSearchMsg::Failed(stderr.trim().to_string()));
+                    } else {
+                        let _ = tx.send(LocalVideoSearchMsg::Results(results));
+                    }
+                }
+                Err(message) => {
+                    let _ = tx.send(LocalVideoSearchMsg::Failed(message));
+                }
+            }
+        })
+        .ok();
+}

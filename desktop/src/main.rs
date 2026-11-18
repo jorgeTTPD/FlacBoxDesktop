@@ -5,7 +5,7 @@ mod theme;
 mod video;
 mod views;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,13 +21,17 @@ use flacplayer::lyrics::Lyrics;
 use flacplayer::player::{Player, Snapshot};
 use flacplayer::shared::{STATUS_ENDED, STATUS_ERROR, STATUS_PAUSED, STATUS_PLAYING};
 
-use internet::{InternetMsg, InternetResult, existing_cached, spawn_download, spawn_search, thumbs_dir};
+use internet::{
+    InternetMsg, InternetResult, LocalVideoSearchMsg, existing_cached, spawn_download, spawn_search,
+    spawn_video_search, thumbs_dir,
+};
 use library::{Library, ScanMsg, Track};
 use video::VideoState;
 use lyrics::{LyricsMode, LyricsRequest, LyricsResult, LyricsStatus};
 use theme::*;
 
-const ART_CACHE_LIMIT: usize = 12;
+const ART_CACHE_LIMIT: usize = 96;
+const ART_MAX_LOADING: usize = 4;
 const ART_MAX_SIDE: u32 = 384;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -35,12 +39,28 @@ struct AppState {
     last_track: Option<String>,
     last_position_ms: u64,
     playlists: Vec<PlaylistState>,
+    #[serde(default)]
+    volume: Option<f32>,
+    #[serde(default)]
+    shuffle: Option<bool>,
+    #[serde(default)]
+    repeat: Option<u8>,
+    #[serde(default)]
+    local_videos: HashMap<String, LocalVideoEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlaylistState {
     pub name: String,
     pub tracks: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalVideoEntry {
+    pub id: String,
+    pub title: String,
+    pub uploader: String,
+    pub duration_ms: u64,
 }
 
 fn app_state_path() -> PathBuf {
@@ -120,9 +140,21 @@ pub struct FlacBox {
     pub folder_focus: FocusHandle,
     pub art_cache: HashMap<PathBuf, Option<Arc<Image>>>,
     art_colors: HashMap<PathBuf, Option<u32>>,
+    art_order: VecDeque<PathBuf>,
+    track_scroll: UniformListScrollHandle,
+    scroll_to_playing: bool,
+    last_show_player: bool,
     pub internet: InternetState,
     pub internet_track: Option<Track>,
     pub internet_titles: HashMap<PathBuf, String>,
+    pub video_candidates: Vec<InternetResult>,
+    pub video_search_open: bool,
+    pub local_video_searching: bool,
+    pub local_video_error: Option<String>,
+    local_video_tx: Sender<LocalVideoSearchMsg>,
+    local_video_rx: Receiver<LocalVideoSearchMsg>,
+    pub local_videos: HashMap<String, LocalVideoEntry>,
+    pub video_local_resume: bool,
     pub video: VideoState,
     video_tx: Sender<video::VideoMsg>,
     video_rx: Receiver<video::VideoMsg>,
@@ -132,6 +164,7 @@ pub struct FlacBox {
     art_loading: HashSet<PathBuf>,
     art_tx: Sender<ArtResult>,
     art_rx: Receiver<ArtResult>,
+    last_persist_ms: i64,
     pub status_line: Option<String>,
     pub lyrics: Option<Lyrics>,
     pub lyrics_status: LyricsStatus,
@@ -181,12 +214,16 @@ impl FlacBox {
         let (art_tx, art_rx) = unbounded();
         let (internet_tx, internet_rx) = unbounded();
         let (video_tx, video_rx) = unbounded();
+        let (local_video_tx, local_video_rx) = unbounded();
 
         let mut folders = library::default_folders();
         folders.extend(read_extra_folders());
-        folders.dedup();
+        let mut seen_folders = HashSet::new();
+        folders.retain(|f| seen_folders.insert(f.clone()));
 
         library::spawn_scan(folders.clone(), tx);
+
+        let show_player = std::env::var_os("FLACBOX_START_PLAYER").is_some();
 
         let mut this = Self {
             player,
@@ -207,13 +244,13 @@ impl FlacBox {
             search_focus: cx.focus_handle(),
             snap: Snapshot::default(),
             queue: Vec::new(),
-            shuffle: false,
-            repeat: 0,
-            volume: 1.0,
+            shuffle: saved.shuffle.unwrap_or(false),
+            repeat: saved.repeat.unwrap_or(0).min(2),
+            volume: saved.volume.unwrap_or(1.0).clamp(0.0, 1.0),
             muted: false,
-            volume_before_mute: 1.0,
+            volume_before_mute: saved.volume.filter(|v| *v > 0.0).unwrap_or(1.0).clamp(0.1, 1.0),
             show_queue: start == "queue",
-            show_player: std::env::var_os("FLACBOX_START_PLAYER").is_some(),
+            show_player,
             np_mode: match std::env::var("FLACBOX_START_MODE").ok().as_deref() {
                 Some("lyrics") => NpMode::Lyrics,
                 _ => NpMode::Cover,
@@ -228,6 +265,10 @@ impl FlacBox {
             folder_focus: cx.focus_handle(),
             art_cache: HashMap::new(),
             art_colors: HashMap::new(),
+            art_order: VecDeque::new(),
+            track_scroll: UniformListScrollHandle::new(),
+            scroll_to_playing: false,
+            last_show_player: show_player,
             internet: InternetState {
                 focus: cx.focus_handle(),
                 query: String::new(),
@@ -243,6 +284,14 @@ impl FlacBox {
             },
             internet_track: None,
             internet_titles: HashMap::new(),
+            video_candidates: Vec::new(),
+            video_search_open: false,
+            local_video_searching: false,
+            local_video_error: None,
+            local_video_tx,
+            local_video_rx,
+            local_videos: saved.local_videos,
+            video_local_resume: false,
             video: VideoState::new(),
             video_tx,
             video_rx,
@@ -269,7 +318,12 @@ impl FlacBox {
             navigation_revision: 1,
             restored_session: false,
             last_saved_track: None,
+            last_persist_ms: 0,
         };
+
+        this.player.send(Cmd::SetVolume(this.volume));
+        this.player.send(Cmd::SetShuffle(this.shuffle));
+        this.player.send(Cmd::SetRepeat(this.repeat));
 
         if let Ok(query) = std::env::var("FLACBOX_START_QUERY") {
             if !query.trim().is_empty() {
@@ -354,6 +408,43 @@ impl FlacBox {
             }
         }
 
+        while let Ok(msg) = self.local_video_rx.try_recv() {
+            match msg {
+                LocalVideoSearchMsg::Results(results) => {
+                    let dur = self
+                        .current_track()
+                        .map(|track| track.duration_ms)
+                        .unwrap_or(0);
+                    let mut results = results;
+                    if dur > 0 {
+                        let lo = dur / 2;
+                        let hi = dur + dur / 2;
+                        let (mut ok, mut rest): (Vec<_>, Vec<_>) = results
+                            .into_iter()
+                            .partition(|result| {
+                                result.duration_ms >= lo && result.duration_ms <= hi
+                            });
+                        ok.append(&mut rest);
+                        results = ok;
+                    }
+                    self.video_candidates = results.into_iter().take(6).collect();
+                    self.local_video_searching = false;
+                    self.local_video_error = if self.video_candidates.is_empty() {
+                        Some("Sin resultados en YouTube".to_string())
+                    } else {
+                        None
+                    };
+                    dirty = true;
+                }
+                LocalVideoSearchMsg::Failed(message) => {
+                    self.local_video_searching = false;
+                    self.local_video_error = Some(message.clone());
+                    self.status_line = Some(message);
+                    dirty = true;
+                }
+            }
+        }
+
         while let Ok(msg) = self.video_rx.try_recv() {
             match msg {
                 video::VideoMsg::Ready { id, path } => {
@@ -385,15 +476,7 @@ impl FlacBox {
                 };
                 Some(Arc::new(Image::from_bytes(format, bytes)))
             });
-            if self.art_cache.len() >= ART_CACHE_LIMIT && !self.art_cache.contains_key(&result.path)
-            {
-                if let Some(oldest) = self.art_cache.keys().next().cloned() {
-                    self.art_cache.remove(&oldest);
-                    self.art_colors.remove(&oldest);
-                }
-            }
-            self.art_colors.insert(result.path.clone(), result.color);
-            self.art_cache.insert(result.path, image);
+            self.cache_art(result.path, image, result.color);
             dirty = true;
         }
 
@@ -419,6 +502,7 @@ impl FlacBox {
         self.last_index = snap.index;
         self.snap = snap;
         self.persist_last_track();
+        self.persist_position();
 
         self.update_lyrics(cx);
         self.update_lyrics_position(cx);
@@ -436,6 +520,12 @@ impl FlacBox {
             self.last_video_pos = video_pos;
             dirty = true;
         }
+
+        if self.last_show_player && !self.show_player {
+            self.scroll_to_playing = true;
+            dirty = true;
+        }
+        self.last_show_player = self.show_player;
 
         if dirty {
             cx.notify();
@@ -554,6 +644,68 @@ impl FlacBox {
         });
     }
 
+    fn persist_position(&mut self) {
+        let Some(path) = self.current_track().map(|track| track.path.clone()) else {
+            return;
+        };
+        if !self.lib.tracks.iter().any(|track| track.path == path) {
+            return;
+        }
+        let position = self.snap.position_ms.max(0);
+        if (position - self.last_persist_ms).abs() < 5000 {
+            return;
+        }
+        self.last_persist_ms = position;
+        let mut state = load_app_state();
+        state.last_track = Some(path.to_string_lossy().to_string());
+        state.last_position_ms = position as u64;
+        state.playlists = self.playlists.clone();
+        state.volume = Some(self.persisted_volume());
+        state.shuffle = Some(self.shuffle);
+        state.repeat = Some(self.repeat);
+        save_app_state(&state);
+    }
+
+    fn persisted_volume(&self) -> f32 {
+        if self.muted || self.volume <= 0.0 {
+            self.volume_before_mute
+        } else {
+            self.volume
+        }
+    }
+
+    pub fn save_settings(&self) {
+        let mut state = load_app_state();
+        state.volume = Some(self.persisted_volume());
+        state.shuffle = Some(self.shuffle);
+        state.repeat = Some(self.repeat);
+        state.playlists = self.playlists.clone();
+        state.local_videos = self.local_videos.clone();
+        save_app_state(&state);
+    }
+
+    pub fn set_shuffle(&mut self, on: bool) {
+        self.shuffle = on;
+        self.player.send(Cmd::SetShuffle(on));
+        self.save_settings();
+    }
+
+    pub fn cycle_repeat(&mut self) {
+        self.repeat = (self.repeat + 1) % 3;
+        self.player.send(Cmd::SetRepeat(self.repeat));
+        self.save_settings();
+    }
+
+    pub fn delete_playlist(&mut self, index: usize) {
+        if index >= self.playlists.len() {
+            return;
+        }
+        let removed = self.playlists.remove(index);
+        self.status_line = Some(format!("Playlist \"{}\" borrada", removed.name));
+        self.playlist_menu = None;
+        self.save_settings();
+    }
+
     fn persist_last_track(&mut self) {
         let Some(path) = self.current_track().map(|track| track.path.clone()) else {
             return;
@@ -569,6 +721,9 @@ impl FlacBox {
         state.last_track = Some(path.to_string_lossy().to_string());
         state.last_position_ms = self.snap.position_ms.max(0) as u64;
         state.playlists = self.playlists.clone();
+        state.volume = Some(self.persisted_volume());
+        state.shuffle = Some(self.shuffle);
+        state.repeat = Some(self.repeat);
         save_app_state(&state);
     }
 
@@ -669,11 +824,6 @@ impl FlacBox {
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
         self.drill = None;
-        if tab != Tab::Albums {
-            self.art_cache.clear();
-            self.art_colors.clear();
-            self.art_loading.clear();
-        }
         self.invalidate_navigation();
     }
 
@@ -757,7 +907,8 @@ impl FlacBox {
             return;
         };
         let title = result.title.clone();
-        if let Ok(bytes) = std::fs::read(thumbs_dir().join(format!("{id}.jpg"))) {
+        let thumb_bytes = std::fs::read(thumbs_dir().join(format!("{id}.jpg"))).ok();
+        if let Some(bytes) = thumb_bytes {
             let color = dominant_color(&bytes);
             let bytes = shrink_art(&bytes);
             let format = if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
@@ -765,9 +916,11 @@ impl FlacBox {
             } else {
                 ImageFormat::Jpeg
             };
-            self.art_cache
-                .insert(path.clone(), Some(Arc::new(Image::from_bytes(format, bytes))));
-            self.art_colors.insert(path.clone(), color);
+            self.cache_art(
+                path.clone(),
+                Some(Arc::new(Image::from_bytes(format, bytes))),
+                color,
+            );
         }
         let track = Track {
             path: path.clone(),
@@ -897,34 +1050,132 @@ impl FlacBox {
         video::spawn_download_video(id, url, self.video_tx.clone());
     }
 
+    fn is_local_video_id(&self, id: &str) -> bool {
+        self.video_candidates.iter().any(|result| result.id == id)
+            || self.local_videos.values().any(|entry| entry.id == id)
+    }
+
     fn start_cached_video(&mut self, id: String, path: PathBuf) {
-        let Some(result) = self
-            .internet
-            .results
-            .iter()
-            .find(|result| result.id == id)
-            .cloned()
-        else {
+        let (title, uploader, duration_ms) = if let Some(result) =
+            self.internet.results.iter().find(|result| result.id == id)
+        {
+            (
+                result.title.clone(),
+                result.uploader.clone(),
+                result.duration_ms,
+            )
+        } else if let Some(result) = self.video_candidates.iter().find(|result| result.id == id) {
+            (
+                result.title.clone(),
+                result.uploader.clone(),
+                result.duration_ms,
+            )
+        } else if let Some(entry) = self.local_videos.values().find(|entry| entry.id == id) {
+            (
+                entry.title.clone(),
+                entry.uploader.clone(),
+                entry.duration_ms,
+            )
+        } else {
             return;
         };
-        self.player.send(Cmd::Stop);
-        let title = result.title.clone();
-        match video::begin_video(
-            &id,
-            path,
-            title,
-            result.uploader,
-            result.duration_ms,
-            &mut self.video,
-        ) {
+        let is_local = self.is_local_video_id(&id);
+        if is_local {
+            self.player.send(Cmd::Pause);
+        } else {
+            self.player.send(Cmd::Stop);
+        }
+        match video::begin_video(&id, path, title, uploader, duration_ms, &mut self.video) {
             Ok(()) => {
                 self.show_player = true;
                 self.np_mode = NpMode::Cover;
                 self.status_line = None;
+                if is_local {
+                    let position = Duration::from_millis(self.snap.position_ms.max(0) as u64);
+                    if let Some(video) = &self.video.video {
+                        let _ = video.seek(position, false);
+                    }
+                    self.video_local_resume = true;
+                }
             }
             Err(message) => {
+                if is_local {
+                    self.player.send(Cmd::Play);
+                }
                 self.status_line = Some(message);
             }
+        }
+    }
+
+    /// Click en el chip VIDEO de una pista local.
+    pub fn on_local_video_click(&mut self) {
+        let Some(track) = self.current_track().cloned() else {
+            return;
+        };
+        if self.is_internet_current() {
+            return;
+        }
+        if self.video.active {
+            return;
+        }
+        let key = track.path.to_string_lossy().to_string();
+        if let Some(entry) = self.local_videos.get(&key).cloned() {
+            let id = entry.id.clone();
+            if let Some(path) = video::existing_video(&id) {
+                self.start_cached_video(id, path);
+                return;
+            }
+            if self.internet.downloading_video.contains(&id) {
+                self.status_line = Some("El video ya se está descargando".to_string());
+                return;
+            }
+            self.internet.downloading_video.insert(id.clone());
+            self.pending_video = Some(id.clone());
+            let url = format!("https://www.youtube.com/watch?v={id}");
+            video::spawn_download_video(id, url, self.video_tx.clone());
+            self.status_line = Some("Descargando video…".to_string());
+            return;
+        }
+        self.video_search_open = true;
+        self.local_video_searching = true;
+        self.local_video_error = None;
+        self.video_candidates.clear();
+        let query = format!("{} {} official video", track.title.trim(), track.artist.trim());
+        spawn_video_search(query, self.local_video_tx.clone());
+    }
+
+    pub fn choose_local_video(&mut self, index: usize) {
+        let Some(candidate) = self.video_candidates.get(index).cloned() else {
+            return;
+        };
+        self.video_search_open = false;
+        let id = candidate.id.clone();
+        if let Some(track) = self.current_track() {
+            self.local_videos.insert(
+                track.path.to_string_lossy().to_string(),
+                LocalVideoEntry {
+                    id: candidate.id.clone(),
+                    title: candidate.title.clone(),
+                    uploader: candidate.uploader.clone(),
+                    duration_ms: candidate.duration_ms,
+                },
+            );
+            self.save_settings();
+        }
+        if let Some(path) = video::existing_video(&id) {
+            self.start_cached_video(id, path);
+            return;
+        }
+        self.internet.downloading_video.insert(id.clone());
+        self.pending_video = Some(id.clone());
+        video::spawn_download_video(id, candidate.url, self.video_tx.clone());
+        self.status_line = Some("Descargando video…".to_string());
+    }
+
+    /// Vuelve del video al audio local reanudando la pista donde iba.
+    pub fn back_to_local_audio(&mut self) {
+        if self.video.active {
+            self.stop_video();
         }
     }
 
@@ -932,6 +1183,10 @@ impl FlacBox {
         self.video.video = None;
         self.video.track = None;
         self.video.active = false;
+        if self.video_local_resume {
+            self.video_local_resume = false;
+            self.player.send(Cmd::Play);
+        }
     }
 
     pub fn play_tracks(&mut self, tracks: &[usize], start: usize) {
@@ -981,6 +1236,7 @@ impl FlacBox {
             self.volume_before_mute = self.volume;
         }
         self.player.send(Cmd::SetVolume(self.volume));
+        self.save_settings();
     }
 
     pub fn toggle_mute(&mut self) {
@@ -993,6 +1249,7 @@ impl FlacBox {
             self.volume = 0.0;
         }
         self.player.send(Cmd::SetVolume(self.volume));
+        self.save_settings();
     }
 
     pub fn current_art_color(&self) -> Option<u32> {
@@ -1016,9 +1273,33 @@ impl FlacBox {
         };
     }
 
+    fn cache_art(&mut self, path: PathBuf, image: Option<Arc<Image>>, color: Option<u32>) {
+        if self.art_cache.contains_key(&path) {
+            self.art_order.retain(|p| p != &path);
+        }
+        self.art_order.push_back(path.clone());
+        self.art_cache.insert(path.clone(), image);
+        self.art_colors.insert(path, color);
+        while self.art_cache.len() > ART_CACHE_LIMIT {
+            let Some(oldest) = self.art_order.pop_front() else {
+                break;
+            };
+            self.art_cache.remove(&oldest);
+            self.art_colors.remove(&oldest);
+        }
+    }
+
     pub fn art(&mut self, path: &PathBuf) -> Option<Arc<Image>> {
         if let Some(cached) = self.art_cache.get(path) {
-            return cached.clone();
+            let cached = cached.clone();
+            if let Some(pos) = self.art_order.iter().position(|p| p == path) {
+                self.art_order.remove(pos);
+                self.art_order.push_back(path.clone());
+            }
+            return cached;
+        }
+        if self.art_loading.len() >= ART_MAX_LOADING {
+            return None;
         }
         if self.art_loading.insert(path.clone()) {
             let path = path.clone();
@@ -1026,6 +1307,27 @@ impl FlacBox {
             std::thread::Builder::new()
                 .name("flacbox-art".into())
                 .spawn(move || {
+                    let cache_dir = art_cache_dir();
+                    let key = art_key(&path);
+                    let thumb_path = cache_dir.join(format!("{key:016x}.png"));
+                    let none_path = cache_dir.join(format!("{key:016x}.none"));
+                    if none_path.is_file() {
+                        let _ = tx.send(ArtResult {
+                            path,
+                            bytes: None,
+                            color: None,
+                        });
+                        return;
+                    }
+                    if let Ok(bytes) = std::fs::read(&thumb_path) {
+                        let color = dominant_color(&bytes);
+                        let _ = tx.send(ArtResult {
+                            path,
+                            bytes: Some(bytes),
+                            color,
+                        });
+                        return;
+                    }
                     let is_image = matches!(
                         path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_lowercase()).as_deref(),
                         Some("jpg") | Some("jpeg") | Some("png")
@@ -1035,9 +1337,30 @@ impl FlacBox {
                     } else {
                         flacplayer::tags::artwork(&path)
                     };
-                    let color = bytes.as_deref().and_then(dominant_color);
-                    let bytes = bytes.map(|bytes| shrink_art(&bytes));
-                    let _ = tx.send(ArtResult { path, bytes, color });
+                    match bytes {
+                        Some(bytes) => {
+                            let color = dominant_color(&bytes);
+                            let bytes = shrink_art(&bytes);
+                            if std::fs::create_dir_all(&cache_dir).is_ok() {
+                                let _ = std::fs::write(&thumb_path, &bytes);
+                            }
+                            let _ = tx.send(ArtResult {
+                                path,
+                                bytes: Some(bytes),
+                                color,
+                            });
+                        }
+                        None => {
+                            if std::fs::create_dir_all(&cache_dir).is_ok() {
+                                let _ = std::fs::write(&none_path, []);
+                            }
+                            let _ = tx.send(ArtResult {
+                                path,
+                                bytes: None,
+                                color: None,
+                            });
+                        }
+                    }
                 })
                 .ok();
         }
@@ -1049,6 +1372,7 @@ impl FlacBox {
         self.art_cache.clear();
         self.art_colors.clear();
         self.art_loading.clear();
+        self.art_order.clear();
         self.invalidate_navigation();
         let (tx, rx) = unbounded();
         self.scan_rx = rx;
@@ -1141,6 +1465,37 @@ fn internet_id_of(track: &Track) -> Option<String> {
         .and_then(|stem| stem.to_str().map(String::from))
 }
 
+fn art_cache_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("flacbox")
+        .join("art")
+}
+
+fn art_key(path: &std::path::Path) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut feed = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    };
+    feed(path.to_string_lossy().as_bytes());
+    if let Ok(meta) = std::fs::metadata(path) {
+        feed(&meta.len().to_le_bytes());
+        if let Ok(mtime) = meta.modified() {
+            if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                feed(&duration.as_millis().to_le_bytes());
+            }
+        }
+    }
+    hash
+}
+
 fn config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".config/flacbox/folders")
@@ -1148,12 +1503,13 @@ fn config_path() -> PathBuf {
 
 fn read_extra_folders() -> Vec<PathBuf> {
     let mut folders = Vec::new();
+    let defaults = library::default_folders();
     if let Ok(content) = std::fs::read_to_string(config_path()) {
         for line in content.lines() {
             let line = line.trim();
             if !line.is_empty() {
                 let p = PathBuf::from(line);
-                if p.is_dir() {
+                if p.is_dir() && !defaults.contains(&p) && !folders.contains(&p) {
                     folders.push(p);
                 }
             }
@@ -1167,8 +1523,10 @@ fn write_extra_folders(folders: &[PathBuf]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let defaults: Vec<PathBuf> = library::default_folders();
     let body: String = folders
         .iter()
+        .filter(|f| !defaults.contains(f))
         .map(|f| format!("{}\n", f.to_string_lossy()))
         .collect();
     let _ = std::fs::write(path, body);
@@ -1205,6 +1563,7 @@ impl Render for FlacBox {
                 .min_h_0()
                 .child(views::sidebar(self, cx))
                 .child(views::main_area(self, cx))
+                .when(self.show_queue, |el| el.child(views::queue_panel(self, cx)))
                 .into_any_element()
         };
 
@@ -1215,6 +1574,14 @@ impl Render for FlacBox {
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                if this.video_search_open && ev.keystroke.key.as_str() == "escape" {
+                    this.video_search_open = false;
+                    cx.notify();
+                    return;
+                }
+                if this.playlist_modal_open || this.add_folder_open || this.video_search_open {
+                    return;
+                }
                 if this.search_focus.is_focused(_window)
                     || this.folder_focus.is_focused(_window)
                     || this.playlist_focus.is_focused(_window)
@@ -1289,6 +1656,9 @@ impl Render for FlacBox {
             })
             .when(self.playlist_modal_open, |el| {
                 el.child(views::create_playlist_modal(self, cx))
+            })
+            .when(self.video_search_open, |el| {
+                el.child(views::local_video_modal(self, cx))
             })
     }
 }

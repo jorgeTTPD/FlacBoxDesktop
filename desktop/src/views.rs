@@ -104,8 +104,7 @@ fn repeat_button(
         .cursor_pointer()
         .hover(|s| s.bg(rgb(SURFACE_HOVER)))
         .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
-            this.repeat = (this.repeat + 1) % 3;
-            this.player.send(Cmd::SetRepeat(this.repeat));
+            this.cycle_repeat();
             cx.notify();
         }))
         .child(icon("↻", 15., color))
@@ -192,6 +191,10 @@ pub fn sidebar(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElemen
                 .px_3()
                 .py_1()
                 .rounded(px(6.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
                 .text_size(px(11.5))
                 .text_color(rgb(TEXT))
                 .cursor_pointer()
@@ -200,7 +203,24 @@ pub fn sidebar(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElemen
                     this.open_playlist(index);
                     cx.notify();
                 }))
-                .child(truncate(&playlist.name, 26))
+                .child(div().min_w_0().child(truncate(&playlist.name, 22)))
+                .child(
+                    div()
+                        .id(("delete-playlist", index))
+                        .size(px(18.))
+                        .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(SURFACE_HI)))
+                        .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+                            cx.stop_propagation();
+                            this.delete_playlist(index);
+                            cx.notify();
+                        }))
+                        .child(div().text_size(px(10.)).text_color(rgb(MUTED)).child("✕")),
+                )
         })
         .collect::<Vec<_>>();
 
@@ -840,6 +860,19 @@ fn duration_long(ms: i64) -> String {
 pub fn songs_list(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> AnyElement {
     let list = this.visible_tracks();
 
+    if this.scroll_to_playing {
+        this.scroll_to_playing = false;
+        if let Some(current) = this.current_track().map(|track| track.path.clone()) {
+            if let Some(pos) = list
+                .iter()
+                .position(|&i| this.lib.tracks[i].path == current)
+            {
+                this.track_scroll
+                    .scroll_to_item(pos, ScrollStrategy::Center);
+            }
+        }
+    }
+
     if list.is_empty() {
         return empty_state(if this.lib.scanning {
             "Escaneando la biblioteca…"
@@ -860,6 +893,7 @@ pub fn songs_list(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> AnyElement {
                 .collect()
         }),
     )
+    .track_scroll(this.track_scroll.clone())
     .flex_1()
     .min_h_0();
 
@@ -1073,13 +1107,13 @@ fn empty_state(text: &'static str) -> impl IntoElement {
 }
 
 fn albums_grid(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
-    if this.lib.albums.is_empty() {
+    let album_count = this.lib.albums.len();
+    if album_count == 0 {
         return empty_state("No hay álbumes todavía.").into_any_element();
     }
 
-    let albums = this.lib.albums.clone();
     const COLUMNS: usize = 5;
-    let rows = albums.len().div_ceil(COLUMNS);
+    let rows = album_count.div_ceil(COLUMNS);
 
     uniform_list(
         "albums-list",
@@ -1088,9 +1122,9 @@ fn albums_grid(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElemen
             range
                 .map(|row| {
                     let start = row * COLUMNS;
-                    let end = (start + COLUMNS).min(albums.len());
+                    let end = (start + COLUMNS).min(this.lib.albums.len());
                     let cards = (start..end)
-                        .map(|index| album_card(this, &albums[index], index, cx))
+                        .map(|index| album_card(this, index, cx))
                         .collect::<Vec<_>>();
                     div().w_full().flex().gap_5().children(cards)
                 })
@@ -1102,16 +1136,20 @@ fn albums_grid(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElemen
     .into_any_element()
 }
 
-fn album_card(
-    this: &mut FlacBox,
-    album: &crate::library::Album,
-    index: usize,
-    cx: &mut Context<FlacBox>,
-) -> AnyElement {
-    let first_path = album
-        .tracks
-        .first()
-        .map(|&track| this.lib.tracks[track].path.clone());
+fn album_card(this: &mut FlacBox, index: usize, cx: &mut Context<FlacBox>) -> AnyElement {
+    let (first_path, name, artist, year, track_count) = {
+        let album = &this.lib.albums[index];
+        (
+            album
+                .tracks
+                .first()
+                .map(|&track| this.lib.tracks[track].path.clone()),
+            album.name.clone(),
+            album.artist.clone(),
+            album.year.clone(),
+            album.tracks.len(),
+        )
+    };
     let art = first_path.and_then(|path| this.art(&path));
     let cover: AnyElement = match art {
         Some(image) => img(image)
@@ -1131,12 +1169,6 @@ fn album_card(
             .child(icon("♫", 26., ACCENT_DIM))
             .into_any_element(),
     };
-    let tracks = album.tracks.clone();
-    let name = album.name.clone();
-    let artist = album.artist.clone();
-    let year = album.year.clone();
-    let track_count = album.tracks.len();
-
     div()
         .id(("album", index))
         .w(px(176.))
@@ -1147,10 +1179,11 @@ fn album_card(
         .cursor_pointer()
         .hover(|s| s.opacity(0.85))
         .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+            let album = &this.lib.albums[index];
             this.open_drill(Drill {
-                title: name.clone(),
-                subtitle: artist.clone(),
-                tracks: tracks.clone(),
+                title: album.name.clone(),
+                subtitle: album.artist.clone(),
+                tracks: album.tracks.clone(),
             });
             this.tab = Tab::Albums;
             cx.notify();
@@ -1160,13 +1193,13 @@ fn album_card(
             div()
                 .text_size(px(12.))
                 .text_color(rgb(TEXT))
-                .child(truncate(&album.name, 22)),
+                .child(truncate(&name, 22)),
         )
         .child(
             div()
                 .text_size(px(11.))
                 .text_color(rgb(MUTED))
-                .child(truncate(&album.artist, 22)),
+                .child(truncate(&artist, 22)),
         )
         .child(
             div()
@@ -1184,66 +1217,61 @@ fn album_card(
 }
 
 fn artists_list(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
-    if this.lib.artists.is_empty() {
+    let count = this.lib.artists.len();
+    if count == 0 {
         return empty_state("No hay artistas todavía.").into_any_element();
     }
 
-    let artists = this.lib.artists.clone();
-    let rows = artists
-        .iter()
-        .enumerate()
-        .map(|(i, artist)| {
-            let tracks = artist.tracks.clone();
-            let name = artist.name.clone();
-            let click_tracks = tracks.clone();
-            let click_name = name.clone();
-            let albums = artist.albums;
-            div()
-                .id(("artist", i))
-                .h(px(46.))
-                .px_3()
-                .rounded(px(6.))
-                .flex()
-                .items_center()
-                .gap_3()
-                .cursor_pointer()
-                .hover(|s| s.bg(rgb(SURFACE_HOVER)))
-                .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
-                    this.open_drill(Drill {
-                        title: click_name.clone(),
-                        subtitle: format!("{} álbumes", albums),
-                        tracks: click_tracks.clone(),
-                    });
-                    this.tab = Tab::Artists;
-                    cx.notify();
-                }))
-                .child(icon("☰", 12., MUTED))
-                .child(div().flex_1().text_size(px(13.)).child(name))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED))
-                        .child(format!("{albums} álbumes")),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(rgb(MUTED))
-                        .child(format!("{} pistas", tracks_len(&tracks))),
-                )
-        })
-        .collect::<Vec<_>>();
-
-    div()
-        .id("artists-scroll")
-        .size_full()
-        .overflow_y_scroll()
-        .children(rows)
-        .into_any_element()
+    uniform_list(
+        "artists-list",
+        count,
+        cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+            range.map(|i| artist_row(this, i, cx)).collect()
+        }),
+    )
+    .size_full()
+    .into_any_element()
 }
 
-fn tracks_len(tracks: &[usize]) -> usize {
-    tracks.len()
+fn artist_row(this: &mut FlacBox, i: usize, cx: &mut Context<FlacBox>) -> impl IntoElement {
+    let (name, albums, track_count) = {
+        let artist = &this.lib.artists[i];
+        (artist.name.clone(), artist.albums, artist.tracks.len())
+    };
+    div()
+        .id(("artist", i))
+        .h(px(46.))
+        .px_3()
+        .rounded(px(6.))
+        .flex()
+        .items_center()
+        .gap_3()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+        .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+            let artist = &this.lib.artists[i];
+            this.open_drill(Drill {
+                title: artist.name.clone(),
+                subtitle: format!("{} álbumes", artist.albums),
+                tracks: artist.tracks.clone(),
+            });
+            this.tab = Tab::Artists;
+            cx.notify();
+        }))
+        .child(icon("☰", 12., MUTED))
+        .child(div().flex_1().text_size(px(13.)).child(name))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(MUTED))
+                .child(format!("{albums} álbumes")),
+        )
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(rgb(MUTED))
+                .child(format!("{track_count} pistas")),
+        )
 }
 
 // ------------------------------------------------------------- video
@@ -1493,8 +1521,7 @@ pub fn player_bar(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoEle
                 .items_center()
                 .gap_2()
                 .child(round_btn("shuffle", "⇄", this.shuffle, cx, |this| {
-                    this.shuffle = !this.shuffle;
-                    this.player.send(Cmd::SetShuffle(this.shuffle));
+                    this.set_shuffle(!this.shuffle);
                 }))
                 .child(
                     div()
@@ -1872,8 +1899,7 @@ fn secondary_row(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElem
         .items_center()
         .gap_4()
         .child(round_btn("np-shuffle", "⇄", this.shuffle, cx, |this| {
-            this.shuffle = !this.shuffle;
-            this.player.send(Cmd::SetShuffle(this.shuffle));
+            this.set_shuffle(!this.shuffle);
         }))
         .child(repeat_button("np-repeat", this, cx))
 }
@@ -1927,7 +1953,76 @@ fn quality_pill(quality: &str) -> impl IntoElement {
         )
 }
 
-fn np_top_bar(this: &mut FlacBox, wide: bool, cx: &mut Context<FlacBox>) -> impl IntoElement {
+fn np_top_bar(this: &mut FlacBox, _wide: bool, cx: &mut Context<FlacBox>) -> impl IntoElement {
+    let lyrics_active = this.np_mode == NpMode::Lyrics;
+    let local_np =
+        this.video_local_resume || (this.np_track().is_some() && !this.is_internet_current());
+    let center: AnyElement = if local_np {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(chip_btn(
+                "np-local-audio-btn",
+                "AUDIO",
+                "▷",
+                !this.video.active,
+                cx,
+                |this| {
+                    this.back_to_local_audio();
+                },
+            ))
+            .child(chip_btn(
+                "np-local-video-btn",
+                "VIDEO",
+                "▣",
+                this.video.active,
+                cx,
+                |this| {
+                    this.on_local_video_click();
+                },
+            ))
+            .into_any_element()
+    } else if this.is_internet_current() {
+        if _wide {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(chip_btn(
+                    "np-audio-btn",
+                    "AUDIO",
+                    "▷",
+                    !this.video.active,
+                    cx,
+                    |this| {
+                        this.start_audio_internet();
+                    },
+                ))
+                .child(chip_btn(
+                    "np-video-btn",
+                    "VIDEO",
+                    "▣",
+                    this.video.active,
+                    cx,
+                    |this| {
+                        this.start_video_internet();
+                    },
+                ))
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        }
+    } else if _wide {
+        div()
+            .text_size(px(10.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(MUTED))
+            .child("R E P R O D U C I E N D O")
+            .into_any_element()
+    } else {
+        div().into_any_element()
+    };
     div()
         .h(px(52.))
         .px_4()
@@ -1957,42 +2052,7 @@ fn np_top_bar(this: &mut FlacBox, wide: bool, cx: &mut Context<FlacBox>) -> impl
                         .child("Biblioteca"),
                 ),
         )
-        .when(wide, |el| {
-            el.child(if this.is_internet_current() {
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(chip_btn(
-                        "np-audio-btn",
-                        "AUDIO",
-                        "▷",
-                        !this.video.active,
-                        cx,
-                        |this| {
-                            this.start_audio_internet();
-                        },
-                    ))
-                    .child(chip_btn(
-                        "np-video-btn",
-                        "VIDEO",
-                        "▣",
-                        this.video.active,
-                        cx,
-                        |this| {
-                            this.start_video_internet();
-                        },
-                    ))
-                    .into_any_element()
-            } else {
-                div()
-                    .text_size(px(10.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(MUTED))
-                    .child("R E P R O D U C I E N D O")
-                    .into_any_element()
-            })
-        })
+        .child(center)
         .child(
             div()
                 .flex()
@@ -2003,7 +2063,7 @@ fn np_top_bar(this: &mut FlacBox, wide: bool, cx: &mut Context<FlacBox>) -> impl
                         "np-lyrics-btn",
                         "LETRA",
                         "♫",
-                        false,
+                        lyrics_active,
                         cx,
                         |this| {
                             this.toggle_np_mode();
@@ -2025,7 +2085,7 @@ fn np_top_bar(this: &mut FlacBox, wide: bool, cx: &mut Context<FlacBox>) -> impl
         )
 }
 
-fn queue_panel(this: &FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
+pub fn queue_panel(this: &FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
     let rows = this
         .queue
         .iter()
@@ -2471,7 +2531,7 @@ fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) 
                                     .text_color(rgb(MUTED))
                                     .child(truncate(&format!("{artist} · {album}"), 58)),
                             )
-                            .child(quality_pill(&quality)),
+                            .when(!quality.is_empty(), |el| el.child(quality_pill(&quality))),
                     )
                     .child(
                         div()
@@ -2535,7 +2595,7 @@ fn portada_view(this: &mut FlacBox, window: &Window, cx: &mut Context<FlacBox>) 
                                     .text_color(rgb(MUTED))
                                     .child(truncate(&format!("{artist} · {album}"), 50)),
                             )
-                            .child(quality_pill(&quality)),
+                            .when(!quality.is_empty(), |el| el.child(quality_pill(&quality))),
                     )
                     .child(
                         div()
@@ -2621,16 +2681,26 @@ pub fn create_playlist_modal(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> i
     };
 
     div()
+        .id("playlist-modal-backdrop")
         .absolute()
         .inset_0()
         .bg(rgba(0x00000088))
         .flex()
         .items_center()
         .justify_center()
+        .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
+            this.playlist_modal_open = false;
+            this.playlist_input.clear();
+            cx.notify();
+        }))
         .child(
             div()
+                .id("playlist-modal-panel")
                 .w(px(420.))
                 .p_5()
+                .on_click(cx.listener(|_this, _ev: &ClickEvent, _w, cx| {
+                    cx.stop_propagation();
+                }))
                 .rounded(px(12.))
                 .bg(rgb(SURFACE))
                 .border_1()
@@ -2744,16 +2814,26 @@ pub fn add_folder_modal(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl I
     };
 
     div()
+        .id("folder-modal-backdrop")
         .absolute()
         .inset_0()
         .bg(rgba(0x00000088))
         .flex()
         .items_center()
         .justify_center()
+        .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
+            this.add_folder_open = false;
+            this.folder_input.clear();
+            cx.notify();
+        }))
         .child(
             div()
+                .id("folder-modal-panel")
                 .w(px(460.))
                 .p_5()
+                .on_click(cx.listener(|_this, _ev: &ClickEvent, _w, cx| {
+                    cx.stop_propagation();
+                }))
                 .rounded(px(12.))
                 .bg(rgb(SURFACE))
                 .border_1()
@@ -2868,4 +2948,217 @@ fn expand_home(input: &str) -> String {
     } else {
         input.to_string()
     }
+}
+
+// ------------------------------------------------------------- modal vídeo local
+
+pub fn local_video_modal(this: &mut FlacBox, cx: &mut Context<FlacBox>) -> impl IntoElement {
+    let (title, artist) = this
+        .np_track()
+        .map(|t| (t.title.clone(), t.artist.clone()))
+        .unwrap_or_else(|| ("Pista local".to_string(), String::new()));
+    let searching = this.local_video_searching;
+    let error = this.local_video_error.clone();
+    let candidate_count = this.video_candidates.len();
+
+    let body: AnyElement = if searching {
+        div()
+            .py_6()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(13.))
+            .text_color(rgb(MUTED))
+            .child("Buscando en YouTube…")
+            .into_any_element()
+    } else if let Some(error) = &error {
+        div()
+            .py_6()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(rgb(0xE08A8A))
+                    .child("No se pudo buscar el video"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(MUTED))
+                    .max_w(px(420.))
+                    .child(truncate(error, 120)),
+            )
+            .into_any_element()
+    } else if candidate_count == 0 {
+        div()
+            .py_6()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(13.))
+            .text_color(rgb(MUTED))
+            .child("Sin resultados")
+            .into_any_element()
+    } else {
+        let rows = (0..candidate_count)
+            .map(|index| video_candidate_row(this, index, cx))
+            .collect::<Vec<_>>();
+        div()
+            .id("video-candidates-scroll")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .overflow_y_scroll()
+            .children(rows)
+            .into_any_element()
+    };
+
+    div()
+        .id("local-video-backdrop")
+        .absolute()
+        .inset_0()
+        .bg(rgba(0x00000088))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
+            this.video_search_open = false;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .id("local-video-panel")
+                .w(px(560.))
+                .p_4()
+                .rounded(px(12.))
+                .bg(rgb(SURFACE))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .on_click(cx.listener(|_this, _ev: &ClickEvent, _w, cx| {
+                    cx.stop_propagation();
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_size(px(15.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child("Vídeo de esta pista"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(MUTED))
+                                        .child(truncate(&format!("{title} · {artist}"), 64)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("close-local-video")
+                                .size(px(28.))
+                                .rounded(px(6.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+                                .on_click(cx.listener(|this, _ev: &ClickEvent, _w, cx| {
+                                    this.video_search_open = false;
+                                    cx.notify();
+                                }))
+                                .child(icon("✕", 12., MUTED)),
+                        ),
+                )
+                .child(body),
+        )
+}
+
+fn video_candidate_row(this: &mut FlacBox, index: usize, cx: &mut Context<FlacBox>) -> AnyElement {
+    let Some(result) = this.video_candidates.get(index) else {
+        return div().into_any_element();
+    };
+    let id = result.id.clone();
+    let title = result.title.clone();
+    let uploader = result.uploader.clone();
+    let duration_ms = result.duration_ms;
+    let view_count = result.view_count;
+    let thumb = this.internet_thumb(&id);
+    let art = this.art(&thumb);
+    let cover: AnyElement = match art {
+        Some(image) => img(image)
+            .w(px(124.))
+            .h(px(70.))
+            .rounded(px(6.))
+            .object_fit(ObjectFit::Cover)
+            .into_any_element(),
+        None => div()
+            .w(px(124.))
+            .h(px(70.))
+            .rounded(px(6.))
+            .bg(rgb(SURFACE_HI))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon("▣", 18., ACCENT_DIM))
+            .into_any_element(),
+    };
+    div()
+        .id(("video-candidate", index))
+        .h(px(78.))
+        .px_2()
+        .rounded(px(8.))
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(SURFACE_HOVER)))
+        .on_click(cx.listener(move |this, _ev: &ClickEvent, _w, cx| {
+            this.choose_local_video(index);
+            cx.notify();
+        }))
+        .child(cover)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(TEXT))
+                        .child(truncate(&title, 56)),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(MUTED))
+                        .child(truncate(&uploader, 44)),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.5))
+                        .text_color(rgb(ACCENT_DIM))
+                        .child(format!(
+                            "{} · {}",
+                            fmt_time(duration_ms as i64),
+                            fmt_views(view_count)
+                        )),
+                ),
+        )
+        .into_any_element()
 }

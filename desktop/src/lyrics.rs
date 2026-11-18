@@ -70,13 +70,6 @@ pub fn spawn_resolve(
         .ok();
 }
 
-/// Prioridad de resolución (igual que tus scripts de Python, pero en Rust):
-/// 1. letra embebida sincronizada · 2. `.lrc` hermano · 3. cache en disco ·
-/// 4. LRCLIB · 5. letra embebida plana como último recurso.
-pub fn resolve(request: &LyricsRequest) -> Option<Lyrics> {
-    resolve_with_mode(request, LyricsMode::Auto)
-}
-
 pub fn resolve_with_mode(request: &LyricsRequest, mode: LyricsMode) -> Option<Lyrics> {
     if mode != LyricsMode::Auto {
         return match mode {
